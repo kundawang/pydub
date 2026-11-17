@@ -1,6 +1,7 @@
 import sys
 import math
 import array
+import warnings
 from .utils import (
     db_to_float,
     ratio_to_db,
@@ -185,6 +186,287 @@ def compress_dynamic_range(seg, threshold=-20.0, ratio=4.0, attack=5.0, release=
         output.append(frame)
     
     return seg._spawn(data=b''.join(output))
+
+
+def _import_numpy():
+    try:
+        import numpy
+        return numpy
+    except ImportError:
+        raise ImportError(
+            "multiband_compress requires numpy. "
+            "Install it with: pip install numpy"
+        )
+
+
+def _validate_band_params(name, values, check):
+    try:
+        values = tuple(values)
+    except TypeError:
+        raise ValueError(
+            "%s must be a sequence of 3 values (low, mid, high), got %r"
+            % (name, values))
+    if len(values) != 3:
+        raise ValueError(
+            "%s must contain exactly 3 values (low, mid, high), got %d"
+            % (name, len(values)))
+    for v in values:
+        if not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError("%s values must be finite numbers, got %r"
+                             % (name, v))
+        check(v)
+    return tuple(float(v) for v in values)
+
+
+def _check_threshold(v):
+    if v > 0:
+        raise ValueError("thresholds values must be <= 0 dBFS, got %r" % (v,))
+
+
+def _check_ratio(v):
+    if v < 1.0:
+        raise ValueError("ratios values must be >= 1.0, got %r" % (v,))
+
+
+def _check_positive_time(v):
+    if v <= 0:
+        raise ValueError("attacks/releases values must be > 0, got %r" % (v,))
+
+
+def _design_lowpass_taps(np, cutoff, frame_rate, numtaps):
+    """Windowed-sinc lowpass FIR (linear phase, constant group delay)."""
+    n = np.arange(numtaps) - (numtaps - 1) / 2.0
+    fc = cutoff / float(frame_rate)
+    h = 2.0 * fc * np.sinc(2.0 * fc * n)
+    h *= np.hamming(numtaps)
+    h /= h.sum()
+    return h
+
+
+def _compress_band_envelope(band, threshold, ratio, attack_coef,
+                            release_coef, env):
+    """
+    Per-sample envelope follower + gain computer for one band of one block.
+
+    `env` is the envelope state carried across blocks (and returned updated),
+    so the detector is seamless no matter how the audio is chunked.
+    """
+    inv_ratio_term = 1.0 - (1.0 / ratio)
+    gains = [1.0] * len(band)
+    for i, sample in enumerate(band):
+        level = sample if sample >= 0 else -sample
+        coef = attack_coef if level > env else release_coef
+        env = coef * env + (1.0 - coef) * level
+        if env > 1e-10:
+            over_db = 20.0 * math.log10(env) - threshold
+            if over_db > 0.0:
+                gains[i] = db_to_float(-over_db * inv_ratio_term)
+    return gains, env
+
+
+@register_pydub_effect
+def multiband_compress(seg, low_crossover=200.0, high_crossover=2000.0,
+                       thresholds=(-20.0, -20.0, -20.0),
+                       ratios=(4.0, 4.0, 4.0),
+                       attacks=(5.0, 5.0, 5.0),
+                       releases=(50.0, 50.0, 50.0),
+                       block_ms=10.0, numtaps=None):
+    """
+    Three-band dynamic range compressor.
+
+    Splits the signal into low / mid / high bands with linear-phase FIR
+    crossover filters, compresses each band independently, and recombines
+    them delay-aligned, so with compression disabled (ratio 1:1 on every
+    band) the output is (nearly) sample-identical to the input.
+
+    Keyword Arguments:
+
+        low_crossover - default: 200.0
+            Crossover frequency in Hz between the low and mid bands. Must be
+            > 0 and < high_crossover.
+
+        high_crossover - default: 2000.0
+            Crossover frequency in Hz between the mid and high bands. Must be
+            > low_crossover and < frame_rate / 2.
+
+        thresholds - default: (-20.0, -20.0, -20.0)
+            Threshold in dBFS for the (low, mid, high) bands. Must be <= 0.
+
+        ratios - default: (4.0, 4.0, 4.0)
+            Compression ratio for the (low, mid, high) bands. 1.0 disables
+            compression for that band. Must be >= 1.0.
+
+        attacks - default: (5.0, 5.0, 5.0)
+            Attack time in milliseconds for the (low, mid, high) bands.
+
+        releases - default: (50.0, 50.0, 50.0)
+            Release time in milliseconds for the (low, mid, high) bands.
+
+        block_ms - default: 10.0
+            Internal processing block size in milliseconds. Filter and
+            envelope state is carried across blocks, so the result does not
+            depend on this value; it only tunes memory/latency trade-offs.
+
+        numtaps - default: None (chosen from the crossover frequencies)
+            Length of the crossover FIR filters (forced odd). Longer filters
+            give steeper band separation but require longer input.
+
+    The returned AudioSegment has the same frame rate, channel count, sample
+    width and duration as the input. Requires numpy.
+    """
+    np = _import_numpy()
+
+    if seg.sample_width not in (1, 2, 4):
+        raise ValueError(
+            "multiband_compress only supports 8, 16 and 32 bit audio "
+            "(sample_width 1, 2 or 4), got sample_width=%r"
+            % (seg.sample_width,))
+
+    nyquist = seg.frame_rate / 2.0
+    for name, freq in (("low_crossover", low_crossover),
+                       ("high_crossover", high_crossover)):
+        if not isinstance(freq, (int, float)) or not math.isfinite(freq):
+            raise ValueError("%s must be a finite number, got %r"
+                             % (name, freq))
+    if not 0.0 < low_crossover < high_crossover < nyquist:
+        raise ValueError(
+            "crossover frequencies must satisfy "
+            "0 < low_crossover < high_crossover < frame_rate/2 "
+            "(got low=%r, high=%r, frame_rate=%r)"
+            % (low_crossover, high_crossover, seg.frame_rate))
+
+    thresholds = _validate_band_params("thresholds", thresholds,
+                                       _check_threshold)
+    ratios = _validate_band_params("ratios", ratios, _check_ratio)
+    attacks = _validate_band_params("attacks", attacks, _check_positive_time)
+    releases = _validate_band_params("releases", releases,
+                                     _check_positive_time)
+
+    if not isinstance(block_ms, (int, float)) or not math.isfinite(block_ms) \
+            or block_ms <= 0:
+        raise ValueError("block_ms must be a finite number > 0, got %r"
+                         % (block_ms,))
+
+    # silence in -> silence out (also avoids log-of-zero in the detector)
+    if seg.max == 0:
+        return seg._spawn(seg.get_array_of_samples())
+
+    frame_rate = seg.frame_rate
+
+    if numtaps is None:
+        transition = min(low_crossover,
+                         high_crossover - low_crossover,
+                         nyquist - high_crossover)
+        # ~3.3 * frame_rate / transition covers the Hamming main lobe
+        numtaps = int(math.ceil(3.3 * frame_rate / transition))
+        numtaps = max(63, min(numtaps, 8191))
+    numtaps = int(numtaps)
+    if numtaps < 3:
+        raise ValueError("numtaps must be >= 3, got %r" % (numtaps,))
+    if numtaps % 2 == 0:
+        numtaps += 1
+
+    if seg.frame_count() < numtaps:
+        raise InvalidDuration(
+            "segment is too short for multiband compression: %d frames "
+            "available, but the crossover filters require at least %d "
+            "frames (use a longer segment, higher crossover frequencies, "
+            "or fewer numtaps)" % (int(seg.frame_count()), numtaps))
+
+    lp_low = _design_lowpass_taps(np, low_crossover, frame_rate, numtaps)
+    lp_mid = _design_lowpass_taps(np, high_crossover, frame_rate, numtaps)
+    delay = (numtaps - 1) // 2  # group delay of each crossover filter
+
+    block_len = max(1, int(round(frame_rate * block_ms / 1000.0)))
+
+    band_params = []
+    for threshold, ratio, attack, release in zip(thresholds, ratios,
+                                                 attacks, releases):
+        attack_coef = math.exp(-1.0 / (attack * frame_rate / 1000.0))
+        release_coef = math.exp(-1.0 / (release * frame_rate / 1000.0))
+        band_params.append((threshold, ratio, attack_coef, release_coef))
+
+    max_amp = float(seg.max_possible_amplitude)
+    min_val, max_val = get_min_max_value(seg.sample_width * 8)
+    clipped = [False]
+
+    def process_channel(mono_seg):
+        x = np.frombuffer(mono_seg._data,
+                          dtype=np.dtype(mono_seg.array_type)
+                          ).astype(np.float64)
+        x /= max_amp
+
+        # pad with 2*delay zeros to flush the crossover filter pipeline so
+        # every input sample gets a fully-processed output sample
+        x = np.concatenate([x, np.zeros(2 * delay)])
+
+        filt_hist = numtaps - 1
+        x_hist = np.zeros(filt_hist)
+        rest_hist = np.zeros(filt_hist)
+        low_delay_hist = np.zeros(delay)
+        envelopes = [0.0, 0.0, 0.0]
+
+        out = np.empty(len(x))
+        pos = 0
+        while pos < len(x):
+            block = x[pos:pos + block_len]
+            size = len(block)
+
+            # stage 1: low band + complementary remainder, both aligned
+            # to input delayed by `delay`
+            x_ext = np.concatenate([x_hist, block])
+            low = np.convolve(x_ext, lp_low, mode='valid')
+            x_hist = x_ext[-filt_hist:]
+            rest = x_ext[delay:delay + size] - low
+
+            # stage 2: split the remainder into mid + high, aligned to
+            # input delayed by 2*delay
+            rest_ext = np.concatenate([rest_hist, rest])
+            mid = np.convolve(rest_ext, lp_mid, mode='valid')
+            rest_hist = rest_ext[-filt_hist:]
+            high = rest_ext[delay:delay + size] - mid
+
+            # delay-align the low band with the mid/high bands
+            low_ext = np.concatenate([low_delay_hist, low])
+            low_aligned = low_ext[:size]
+            low_delay_hist = low_ext[size:]
+
+            mixed = np.zeros(size)
+            for band_i, band in enumerate((low_aligned, mid, high)):
+                gains, envelopes[band_i] = _compress_band_envelope(
+                    band, *band_params[band_i], envelopes[band_i])
+                mixed += band * np.asarray(gains)
+
+            out[pos:pos + size] = mixed
+            pos += size
+
+        # drop the 2*delay of pipeline latency so output lines up with input
+        out = out[2 * delay:]
+
+        int_samples = out * max_amp
+        if np.any(int_samples > max_val) or np.any(int_samples < min_val):
+            clipped[0] = True
+            int_samples = np.clip(int_samples, min_val, max_val)
+        return np.rint(int_samples).astype(np.dtype(mono_seg.array_type))
+
+    mono_channels = seg.split_to_mono()
+    processed = [process_channel(ch) for ch in mono_channels]
+
+    if len(processed) == 1:
+        out_data = processed[0]
+    else:
+        out_data = np.empty(len(processed[0]) * len(processed),
+                            dtype=processed[0].dtype)
+        for ch_i, ch_data in enumerate(processed):
+            out_data[ch_i::len(processed)] = ch_data
+
+    if clipped[0]:
+        warnings.warn(
+            "multiband_compress: output exceeded the maximum sample value "
+            "and was clipped; consider lower thresholds/ratios or reducing "
+            "the input gain", UserWarning)
+
+    return seg._spawn(out_data.tobytes())
 
 
 # Invert the phase of the signal.

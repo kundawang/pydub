@@ -1,3 +1,9 @@
+# Unreleased
+- Add `AudioSegment.multiband_compress()` (in `pydub.effects`): a three-band
+  dynamic range compressor with two configurable crossover frequencies and
+  per-band threshold/ratio/attack/release. Uses linear-phase FIR crossovers
+  with delay-aligned recombination (requires numpy)
+
 # v0.25.1
 - Fix crashing bug in new scipy-powered EQ effects
 

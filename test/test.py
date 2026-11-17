@@ -1331,6 +1331,221 @@ class FilterTests(unittest.TestCase):
         self.assertAlmostEqual(less_treble.dBFS, s.dBFS, places=0)
 
 
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+
+@unittest.skipUnless(HAS_NUMPY, "multiband_compress requires numpy")
+class MultibandCompressionTests(unittest.TestCase):
+
+    FRAME_RATE = 44100
+    LOW_XOVER = 300.0
+    HIGH_XOVER = 3000.0
+
+    def make_segment(self, samples, channels=1, sample_width=2):
+        return AudioSegment(
+            data=samples.tobytes(),
+            sample_width=sample_width,
+            frame_rate=self.FRAME_RATE,
+            channels=channels,
+        )
+
+    def tone(self, freq, amp=0.5, seconds=1.0):
+        t = np.arange(int(self.FRAME_RATE * seconds)) / self.FRAME_RATE
+        return (amp * np.sin(2 * np.pi * freq * t) * 32767).astype('<i2')
+
+    def fixture(self):
+        """Low/mid/high sines plus an impulse, 1 second, mono 16-bit."""
+        t = np.arange(self.FRAME_RATE) / self.FRAME_RATE
+        sig = (0.5 * np.sin(2 * np.pi * 100 * t)
+               + 0.2 * np.sin(2 * np.pi * 800 * t)
+               + 0.1 * np.sin(2 * np.pi * 8000 * t))
+        sig[10000] = 0.95  # impulse (overwrite so it is the global peak)
+        return np.clip(sig * 32767, -32768, 32767).astype('<i2')
+
+    def samples(self, seg):
+        return np.frombuffer(seg._data, dtype='<i2').astype(np.float64)
+
+    def rms_dbfs(self, seg, skip_ms=200):
+        a = self.samples(seg)[int(self.FRAME_RATE * skip_ms / 1000):]
+        return 20 * np.log10(np.sqrt((a ** 2).mean()) / 32768.0)
+
+    def test_output_format_matches_input(self):
+        seg = self.make_segment(self.fixture())
+        out = seg.multiband_compress(low_crossover=self.LOW_XOVER,
+                                     high_crossover=self.HIGH_XOVER)
+        self.assertEqual(out.frame_rate, seg.frame_rate)
+        self.assertEqual(out.channels, seg.channels)
+        self.assertEqual(out.sample_width, seg.sample_width)
+        self.assertEqual(len(out), len(seg))
+
+    def test_stereo_output_format_matches_input(self):
+        mono = self.make_segment(self.fixture())
+        seg = AudioSegment.from_mono_audiosegments(mono, mono)
+        out = seg.multiband_compress(low_crossover=self.LOW_XOVER,
+                                     high_crossover=self.HIGH_XOVER)
+        self.assertEqual(out.channels, 2)
+        self.assertEqual(out.frame_rate, seg.frame_rate)
+        self.assertEqual(len(out), len(seg))
+
+    def test_reconstruction_without_compression(self):
+        # ratio 1:1 on every band disables compression; the recombined
+        # waveform should be (nearly) identical to the original
+        seg = self.make_segment(self.fixture())
+        out = seg.multiband_compress(low_crossover=self.LOW_XOVER,
+                                     high_crossover=self.HIGH_XOVER,
+                                     ratios=(1.0, 1.0, 1.0))
+        diff = np.abs(self.samples(seg) - self.samples(out))
+        # integer rounding only: within 2 LSB
+        self.assertTrue(diff.max() <= 2)
+
+    def test_block_size_does_not_change_output(self):
+        seg = self.make_segment(self.fixture())
+        kwargs = dict(low_crossover=self.LOW_XOVER,
+                      high_crossover=self.HIGH_XOVER,
+                      thresholds=(-30.0, -25.0, -20.0))
+        out1 = seg.multiband_compress(block_ms=5.0, **kwargs)
+        out2 = seg.multiband_compress(block_ms=23.7, **kwargs)
+        self.assertEqual(out1._data, out2._data)
+
+    def assert_band_gain(self, freq, band_i):
+        # compress only band `band_i` of a pure tone that lives in it
+        thresholds = [0.0, 0.0, 0.0]
+        ratios = [1.0, 1.0, 1.0]
+        thresholds[band_i] = -20.0
+        ratios[band_i] = 4.0
+        seg = self.make_segment(self.tone(freq))
+        out = seg.multiband_compress(low_crossover=self.LOW_XOVER,
+                                     high_crossover=self.HIGH_XOVER,
+                                     thresholds=thresholds, ratios=ratios,
+                                     attacks=(1.0, 1.0, 1.0),
+                                     releases=(20.0, 20.0, 20.0))
+        in_db = self.rms_dbfs(seg)
+        out_db = self.rms_dbfs(out)
+        # the envelope detector settles near the tone's peak (-6 dBFS for
+        # amp 0.5), so expect roughly: out = in - (peak_db - thr)*(1-1/ratio)
+        expected_reduction = (-6.0 - (-20.0)) * (1 - 1 / 4.0)
+        self.assertAlmostEqual(in_db - out_db, expected_reduction, delta=2.0)
+        # and it must actually have compressed
+        self.assertTrue(out_db < in_db - 5.0)
+
+    def test_low_band_gain(self):
+        self.assert_band_gain(100, 0)
+
+    def test_mid_band_gain(self):
+        self.assert_band_gain(800, 1)
+
+    def test_high_band_gain(self):
+        self.assert_band_gain(8000, 2)
+
+    def test_compression_is_band_selective(self):
+        # a high tone must pass untouched when only the low band compresses
+        seg = self.make_segment(self.tone(8000))
+        out = seg.multiband_compress(low_crossover=self.LOW_XOVER,
+                                     high_crossover=self.HIGH_XOVER,
+                                     thresholds=(-40.0, 0.0, 0.0),
+                                     ratios=(8.0, 1.0, 1.0))
+        self.assertAlmostEqual(self.rms_dbfs(out), self.rms_dbfs(seg),
+                               delta=0.5)
+
+    def test_impulse_survives_reconstruction(self):
+        samples = self.fixture()
+        seg = self.make_segment(samples)
+        out = seg.multiband_compress(low_crossover=self.LOW_XOVER,
+                                     high_crossover=self.HIGH_XOVER,
+                                     ratios=(1.0, 1.0, 1.0))
+        out_samples = self.samples(out)
+        # impulse stays at the same position (delay-aligned recombination)
+        self.assertEqual(np.argmax(np.abs(out_samples)), 10000)
+        self.assertAlmostEqual(out_samples[10000], samples[10000], delta=2.0)
+
+    def test_invalid_crossovers(self):
+        seg = self.make_segment(self.fixture())
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(low_crossover=3000, high_crossover=300)
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(low_crossover=-100)
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(high_crossover=self.FRAME_RATE)
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(low_crossover=float('nan'))
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(high_crossover=float('inf'))
+
+    def test_nonfinite_and_out_of_range_band_params(self):
+        seg = self.make_segment(self.fixture())
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(thresholds=(float('nan'), 0.0, 0.0))
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(ratios=(1.0, float('inf'), 1.0))
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(attacks=(-1.0, 5.0, 5.0))
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(releases=(50.0, 0.0, 50.0))
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(ratios=(0.5, 1.0, 1.0))
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(thresholds=(1.0, 0.0, 0.0))
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(thresholds=(-20.0, -20.0))
+        with self.assertRaises(ValueError):
+            seg.multiband_compress(block_ms=0)
+
+    def test_too_short_segment(self):
+        seg = self.make_segment(self.tone(100, seconds=0.005))
+        with self.assertRaises(InvalidDuration):
+            seg.multiband_compress()
+
+    def test_silent_segment_returns_silence(self):
+        seg = AudioSegment.silent(duration=1000, frame_rate=self.FRAME_RATE)
+        out = seg.multiband_compress()
+        self.assertEqual(out.max, 0)
+        self.assertEqual(len(out), len(seg))
+
+    def test_unsupported_sample_width(self):
+        seg = self.make_segment(self.fixture())
+        seg.sample_width = 3  # not a supported container width
+        with self.assertRaises(ValueError):
+            seg.multiband_compress()
+
+    def test_clipping_warns_and_clips(self):
+        # full-scale low-frequency square wave with the high band squashed:
+        # crossover filter overshoot no longer cancels and the sum clips
+        t = np.arange(self.FRAME_RATE) / self.FRAME_RATE
+        sq = np.where(np.sin(2 * np.pi * 50 * t) >= 0,
+                      32767, -32768).astype('<i2')
+        seg = self.make_segment(sq)
+        with self.assertWarns(UserWarning):
+            out = seg.multiband_compress(low_crossover=self.LOW_XOVER,
+                                         high_crossover=self.HIGH_XOVER,
+                                         thresholds=(0.0, 0.0, -60.0),
+                                         ratios=(1.0, 1.0, 20.0),
+                                         numtaps=255)
+        self.assertLessEqual(self.samples(out).max(), 32767)
+        self.assertGreaterEqual(self.samples(out).min(), -32768)
+
+    def test_real_audio_file(self):
+        seg = AudioSegment.from_wav(os.path.join(data_dir, 'test1.wav'))
+        out = seg.multiband_compress(low_crossover=self.LOW_XOVER,
+                                     high_crossover=self.HIGH_XOVER,
+                                     thresholds=(-30.0, -25.0, -20.0),
+                                     ratios=(6.0, 4.0, 3.0))
+        self.assertEqual(out.frame_rate, seg.frame_rate)
+        self.assertEqual(out.channels, seg.channels)
+        self.assertEqual(len(out), len(seg))
+        # compression reduces overall loudness and peaks
+        self.assertTrue(out.dBFS < seg.dBFS)
+        self.assertTrue(out.max < seg.max)
+        # bypassed bands reconstruct the original recording
+        bypass = seg.multiband_compress(low_crossover=self.LOW_XOVER,
+                                        high_crossover=self.HIGH_XOVER,
+                                        ratios=(1.0, 1.0, 1.0))
+        self.assertAlmostEqual(bypass.dBFS, seg.dBFS, delta=0.1)
+
+
 class PartialAudioSegmentLoadTests(unittest.TestCase):
 
     def setUp(self):
