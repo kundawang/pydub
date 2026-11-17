@@ -41,6 +41,7 @@ from .exceptions import (
     CouldntEncodeError,
     MissingAudioParameter,
 )
+from .true_peak import measure_true_peak
 
 if sys.version_info >= (3, 0):
     basestring = str
@@ -1108,6 +1109,29 @@ class AudioSegment(object):
     @property
     def max_dBFS(self):
         return ratio_to_db(self.max, self.max_possible_amplitude)
+
+    def true_peak(self, chunk_ms=1000):
+        """
+        Measure the true peak (inter-sample peak) of each channel by
+        oversampling the audio with a fixed 4x polyphase interpolation
+        filter, and report it next to the plain sample peak.
+
+        Returns a ``pydub.true_peak.TruePeakMeasurement`` with per-channel
+        linear peaks (``sample_peaks`` / ``true_peaks``), their dBFS / dBTP
+        equivalents, and the global ``max_true_peak_dbtp``. Long audio is
+        processed in chunks of ``chunk_ms`` milliseconds while carrying the
+        filter state across chunk boundaries, so the chunk size does not
+        affect the result. The audio data itself is not modified.
+
+        Empty or silent segments report 0.0 (-inf dB) and never NaN.
+        """
+        return measure_true_peak(
+            self._data,
+            self.sample_width,
+            self.channels,
+            self.frame_rate,
+            chunk_ms=chunk_ms,
+        )
 
     @property
     def duration_seconds(self):

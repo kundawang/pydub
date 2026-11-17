@@ -1,3 +1,6 @@
+# Unreleased
+- Add `AudioSegment.true_peak()`: per-channel true peak (inter-sample peak) measurement via fixed 4x oversampling, reported alongside sample peaks (dBFS vs dBTP), with chunked processing for long audio
+
 # v0.25.1
 - Fix crashing bug in new scipy-powered EQ effects
 

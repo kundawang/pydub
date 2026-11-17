@@ -1,4 +1,5 @@
 from functools import partial
+import math
 import os
 import sys
 import unittest
@@ -31,6 +32,13 @@ from pydub.exceptions import (
 from pydub.silence import (
     detect_silence,
     split_on_silence,
+)
+from pydub.true_peak import (
+    OVERSAMPLE_FACTOR,
+    TruePeakMeasurement,
+    measure_true_peak,
+    _finite,
+    _measure_channel_python,
 )
 from pydub.generators import (
     Sine,
@@ -1086,13 +1094,193 @@ class AudioSegmentTests(unittest.TestCase):
             tmp_wav_file.flush()
             self.assertRaises(CouldntDecodeError, AudioSegment.from_file, tmp_wav_file.name)
             files = os.listdir(tempfile.tempdir)
-            self.assertEquals(files, [os.path.basename(tmp_wav_file.name)])
+            self.assertEqual(files, [os.path.basename(tmp_wav_file.name)])
 
         if sys.platform == 'win32':
             os.remove(tmp_wav_file.name)
 
         tempfile.tempdir = orig_tmpdir
         os.rmdir(new_tmpdir)
+
+
+class TruePeakTests(unittest.TestCase):
+
+    @staticmethod
+    def _sine_segment(freq, amplitude, frame_rate=44100, duration=0.1,
+                      channels=1, sample_width=2, phase=0.0):
+        import math
+        from array import array
+        n_frames = int(frame_rate * duration)
+        max_val = (1 << (sample_width * 8 - 1)) - 1
+        frames = array("h" if sample_width == 2 else "i")
+        for i in range(n_frames):
+            v = int(amplitude * max_val *
+                    math.sin(phase + 2 * math.pi * freq * i / frame_rate))
+            for _ in range(channels):
+                frames.append(v)
+        return AudioSegment(data=frames.tobytes(), sample_width=sample_width,
+                            frame_rate=frame_rate, channels=channels)
+
+    def test_known_true_peak_of_high_frequency_sine(self):
+        # Sine at fs/4 sampled at 45-degree phase: every sample sits at
+        # +/- amplitude/sqrt(2), but the reconstructed waveform peaks at
+        # the full amplitude between samples.
+        import math
+        amplitude = 0.5
+        seg = self._sine_segment(44100 / 4.0, amplitude, phase=math.pi / 4)
+        m = seg.true_peak()
+
+        expected_sample_peak = amplitude / math.sqrt(2)
+        self.assertEqual(m.channels, 1)
+        self.assertAlmostEqual(m.sample_peaks[0], expected_sample_peak,
+                               delta=0.001)
+        self.assertGreater(m.true_peaks[0], m.sample_peaks[0])
+        self.assertAlmostEqual(m.true_peaks[0], amplitude, delta=0.02)
+        self.assertAlmostEqual(m.true_peaks_dbtp[0],
+                               20 * math.log10(amplitude), delta=0.2)
+        self.assertAlmostEqual(m.max_true_peak_dbtp, m.true_peaks_dbtp[0])
+
+    def test_sample_peak_distinguished_from_intersample_peak(self):
+        # Full-scale square-ish wave at Nyquist/2 never clips on a sample
+        # peak meter but overshoots between samples.
+        seg = self._sine_segment(11025, 0.9, phase=0.3)
+        m = seg.true_peak()
+        self.assertLessEqual(m.sample_peaks[0], 1.0)
+        self.assertGreater(m.true_peaks[0], m.sample_peaks[0])
+
+    def test_chunk_size_invariance(self):
+        import math
+        from array import array
+        frame_rate = 44100
+        n_frames = frame_rate // 2
+        frames = array("h", (
+            int(20000 * math.sin(2 * math.pi * 3000 * i / frame_rate)
+                * math.sin(2 * math.pi * 17 * i / frame_rate))
+            for i in range(n_frames)))
+        seg = AudioSegment(data=frames.tobytes(), sample_width=2,
+                           frame_rate=frame_rate, channels=1)
+        reference = seg.true_peak(chunk_ms=1000)
+        for chunk_ms in (113, 37, 3):
+            m = seg.true_peak(chunk_ms=chunk_ms)
+            self.assertAlmostEqual(m.true_peaks[0], reference.true_peaks[0],
+                                   places=9)
+            self.assertEqual(m.sample_peaks, reference.sample_peaks)
+
+    def test_does_not_modify_segment(self):
+        seg = self._sine_segment(997, 0.7, channels=2)
+        data_before = seg._data
+        seg.true_peak()
+        self.assertEqual(seg._data, data_before)
+
+    def test_empty_segment(self):
+        m = AudioSegment.empty().true_peak()
+        self.assertEqual(m.sample_peaks, (0.0,))
+        self.assertEqual(m.true_peaks, (0.0,))
+        self.assertEqual(m.max_true_peak_dbtp, -float("inf"))
+        for value in m.true_peaks_dbtp + m.sample_peaks_dbfs:
+            self.assertFalse(math.isnan(value))
+
+    def test_silence(self):
+        m = AudioSegment.silent(500, frame_rate=44100).set_channels(2).true_peak()
+        self.assertEqual(m.channels, 2)
+        self.assertEqual(m.true_peaks, (0.0, 0.0))
+        self.assertEqual(m.true_peaks_dbtp,
+                         (-float("inf"), -float("inf")))
+        self.assertFalse(math.isnan(m.max_true_peak_dbtp))
+
+    def test_invalid_channel_layout(self):
+        self.assertRaises(ValueError, measure_true_peak,
+                          b"\x00\x00" * 16, 2, 0, 44100)
+        self.assertRaises(ValueError, measure_true_peak,
+                          b"\x00\x00" * 16, 2, -2, 44100)
+        self.assertRaises(ValueError, measure_true_peak,
+                          b"\x00\x00" * 16, 5, 1, 44100)
+
+    def test_partial_trailing_frame_ignored(self):
+        seg = self._sine_segment(440, 0.5)
+        m = measure_true_peak(seg._data + b"\x01", seg.sample_width,
+                              seg.channels, seg.frame_rate)
+        self.assertAlmostEqual(m.true_peaks[0], 0.5, delta=0.02)
+
+    def test_non_finite_input_does_not_produce_nan(self):
+        self.assertEqual(_finite(float("nan")), 0.0)
+        self.assertEqual(_finite(float("inf")), 0.0)
+        self.assertEqual(_finite(float("-inf")), 0.0)
+        self.assertEqual(_finite(0.25), 0.25)
+        peak = _measure_channel_python(
+            [float("nan"), float("inf"), 0.5, -0.5, float("-inf")], 4)
+        self.assertFalse(math.isnan(peak))
+        self.assertTrue(math.isfinite(peak))
+
+    def test_per_channel_reporting(self):
+        import math
+        from array import array
+        frame_rate = 44100
+        n_frames = 4096
+        frames = array("h")
+        for i in range(n_frames):
+            t = 2 * math.pi * 5000 * i / frame_rate
+            frames.append(int(0.6 * 32767 * math.sin(t)))
+            frames.append(int(0.2 * 32767 * math.sin(t)))
+        seg = AudioSegment(data=frames.tobytes(), sample_width=2,
+                           frame_rate=frame_rate, channels=2)
+        m = seg.true_peak()
+        self.assertEqual(m.channels, 2)
+        self.assertEqual(len(m.true_peaks_dbtp), 2)
+        self.assertAlmostEqual(m.true_peaks[0], 0.6, delta=0.02)
+        self.assertAlmostEqual(m.true_peaks[1], 0.2, delta=0.02)
+        self.assertAlmostEqual(m.max_true_peak, m.true_peaks[0])
+        self.assertAlmostEqual(m.max_true_peak_dbtp, m.true_peaks_dbtp[0])
+
+    def test_fixed_oversampling_factor(self):
+        m = self._sine_segment(1000, 0.5).true_peak()
+        self.assertGreaterEqual(m.oversample, 4)
+        self.assertEqual(m.oversample, OVERSAMPLE_FACTOR)
+
+    def test_supported_bit_depths(self):
+        import math
+        from array import array
+        frame_rate = 32000
+        n_frames = 2048
+        floats = [0.4 * math.sin(2 * math.pi * 4000 * i / frame_rate)
+                  for i in range(n_frames)]
+
+        # pydub stores 8-bit audio internally as signed PCM
+        seg8 = AudioSegment(data=bytes(
+            int(round(v * 127)) & 0xFF for v in floats),
+            sample_width=1, frame_rate=frame_rate, channels=1)
+        m8 = seg8.true_peak()
+        self.assertAlmostEqual(m8.true_peaks[0], 0.4, delta=0.03)
+
+        frames32 = array("i", (int(v * (2 ** 31 - 1)) for v in floats))
+        seg32 = AudioSegment(data=frames32.tobytes(), sample_width=4,
+                             frame_rate=frame_rate, channels=1)
+        m32 = seg32.true_peak()
+        self.assertAlmostEqual(m32.true_peaks[0], 0.4, delta=0.02)
+        self.assertFalse(math.isnan(m32.max_true_peak_dbtp))
+
+    def test_real_audio_files(self):
+        for name in ("test1.wav", "test1-8bit.wav", "test1-24bit.wav"):
+            seg = AudioSegment.from_wav(os.path.join(data_dir, name))
+            m = seg.true_peak()
+            self.assertEqual(m.channels, seg.channels)
+            for sample_peak, true_peak in zip(m.sample_peaks, m.true_peaks):
+                self.assertGreater(true_peak, 0.0)
+                # true peak never falls below the sample peak
+                self.assertGreaterEqual(true_peak, sample_peak - 1e-9)
+            self.assertFalse(math.isnan(m.max_true_peak_dbtp))
+
+    def test_numpy_path_matches_pure_python(self):
+        from pydub import true_peak as true_peak_module
+        if true_peak_module._np is None:
+            self.skipTest("numpy is not installed")
+        import math
+        samples = [0.8 * math.sin(2 * math.pi * 3000 * i / 44100)
+                   for i in range(5000)]
+        for chunk in (4096, 257, 64):
+            expected = _measure_channel_python(samples, chunk)
+            got = true_peak_module._measure_channel_numpy(samples, chunk)
+            self.assertAlmostEqual(got, expected, places=12)
 
 
 class SilenceTests(unittest.TestCase):
@@ -1109,7 +1297,7 @@ class SilenceTests(unittest.TestCase):
 
     def test_split_on_silence_complete_silence(self):
         seg = AudioSegment.silent(5000)
-        self.assertEquals( split_on_silence(seg), [] )
+        self.assertEqual( split_on_silence(seg), [] )
 
     def test_split_on_silence_test1(self):
         self.assertEqual(

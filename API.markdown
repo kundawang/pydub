@@ -215,6 +215,29 @@ sound = AudioSegment.from_file("sound1.wav")
 loudness = sound.dBFS
 ```
 
+### AudioSegment(…).true_peak()
+
+Measures the true peak (inter-sample peak) of each channel by oversampling the audio with a fixed 4x polyphase interpolation filter. A master whose sample peaks never reach 0 dBFS can still overshoot full scale between samples (and clip after lossy encoding or D/A conversion) — this measurement catches that.
+
+Returns a `pydub.true_peak.TruePeakMeasurement` with per-channel results and global maxima:
+
+- `sample_peaks` / `true_peaks`: per-channel linear peaks (1.0 == 0 dBFS)
+- `sample_peaks_dbfs` / `true_peaks_dbtp`: the same per-channel peaks in dB
+- `max_sample_peak` / `max_true_peak`: highest peak across all channels (linear)
+- `max_sample_peak_dbfs` / `max_true_peak_dbtp`: highest peak across all channels (dB)
+
+Long audio is processed in chunks (the `chunk_ms` keyword controls the chunk length, default 1000 ms) while carrying the filter state across chunk boundaries, so the chunk size does not affect the result. The audio data is not modified. Empty or silent segments report `0.0` (`-inf` dB), never NaN.
+
+```python
+from pydub import AudioSegment
+sound = AudioSegment.from_file("sound1.wav")
+
+measurement = sound.true_peak()
+measurement.true_peaks        # per-channel linear true peaks, e.g. (0.98, 1.03)
+measurement.true_peaks_dbtp   # per-channel true peaks in dBTP, e.g. (-0.18, 0.26)
+measurement.max_true_peak_dbtp  # global worst-case true peak in dBTP
+```
+
 ### AudioSegment(…).channels
 
 Number of channels in this audio segment (1 means mono, 2 means stereo)
