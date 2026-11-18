@@ -673,6 +673,40 @@ Returns list of audio segments from splitting audio_segment on silent sections.
   When the length of the silence is less than the keep_silence duration it is split evenly between the preceding and following non-silent segments.
   If True is specified, all the silence is kept, if False none is kept.
 
+### silence.compress_silence()
+
+Shortens the silent pauses between non-silent sections while keeping a configurable amount of silence on each side of every pause. Silence at the beginning or end of the segment is never removed, and silences shorter than `min_silence_len` are left untouched.
+
+Returns a tuple `(compressed_segment, mapping)`. `mapping` is a list of `(src_start, src_end, dst_start, dst_end)` tuples in milliseconds covering the whole original timeline: kept sections point at the audio they became, while removed sections map to an empty destination (`dst_start == dst_end`) at the splice point.
+
+```python
+from pydub import AudioSegment, silence
+
+seg = AudioSegment.silent(500) + tone + AudioSegment.silent(3000) + tone
+compressed, mapping = silence.compress_silence(
+    seg, min_silence_len=1000, silence_thresh=-30,
+    keep_silence=100, crossfade=10)
+```
+
+An AudioSegment effect returning only the compressed segment is available as `AudioSegment.compress_silence_effect()`.
+
+**Supported keyword arguments**:
+
+- `min_silence_len` | example: `500` | default: 1000
+  The minimum length in milliseconds of a pause for it to be compressed.
+
+- `silence_thresh` | example: `-20` | default: -16
+  The upper bound for how quiet is silent in dBFS. Must be a real number <= 0; otherwise an `InvalidThreshold` exception is raised.
+
+- `keep_silence` | example: `200` | default: 100
+  Amount of original silence in milliseconds preserved on each side of a compressed pause. A pause shorter than `2 * keep_silence` is kept in full.
+
+- `crossfade` | example: `25` | default: 10
+  Crossfade in milliseconds applied at each splice to avoid clicks. It is clamped to half the length of the shortest piece being joined, so it can never exceed the available audio. Use 0 for a hard, sample-exact splice.
+
+- `seek_step` | example: `5` | default: 1
+  Size of the step for checking for silence in milliseconds. Smaller is more precise.
+
 ### silence.detect_leading_silence()
 
 Returns the millisecond/index that the leading silence ends. If there is no end it will return the length of the audio_segment.

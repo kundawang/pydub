@@ -12,6 +12,10 @@ class InvalidDuration(PydubException):
     pass
 
 
+class InvalidThreshold(PydubException):
+    pass
+
+
 class InvalidTag(PydubException):
     pass
 

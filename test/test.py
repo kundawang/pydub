@@ -25,12 +25,14 @@ from pydub.exceptions import (
     InvalidTag,
     InvalidID3TagVersion,
     InvalidDuration,
+    InvalidThreshold,
     CouldntDecodeError,
     MissingAudioParameter,
 )
 from pydub.silence import (
     detect_silence,
     split_on_silence,
+    compress_silence,
 )
 from pydub.generators import (
     Sine,
@@ -1086,7 +1088,7 @@ class AudioSegmentTests(unittest.TestCase):
             tmp_wav_file.flush()
             self.assertRaises(CouldntDecodeError, AudioSegment.from_file, tmp_wav_file.name)
             files = os.listdir(tempfile.tempdir)
-            self.assertEquals(files, [os.path.basename(tmp_wav_file.name)])
+            self.assertEqual(files, [os.path.basename(tmp_wav_file.name)])
 
         if sys.platform == 'win32':
             os.remove(tmp_wav_file.name)
@@ -1109,7 +1111,7 @@ class SilenceTests(unittest.TestCase):
 
     def test_split_on_silence_complete_silence(self):
         seg = AudioSegment.silent(5000)
-        self.assertEquals( split_on_silence(seg), [] )
+        self.assertEqual( split_on_silence(seg), [] )
 
     def test_split_on_silence_test1(self):
         self.assertEqual(
@@ -1152,6 +1154,294 @@ class SilenceTests(unittest.TestCase):
         for start, end in silent_ranges:
             self.assertTrue(start > prev_end)
             prev_end = end
+
+
+class CompressSilenceTests(unittest.TestCase):
+    """Deterministic tests built from pulses and a low-noise floor so the
+    exact output length, mapping and splice bytes can be asserted."""
+
+    sample_rate = 8000
+
+    def setUp(self):
+        self.tone = Sine(440, sample_rate=self.sample_rate).to_audio_segment(
+            duration=300, volume=-6)
+        self.silence = lambda ms: AudioSegment.silent(
+            duration=ms, frame_rate=self.sample_rate)
+
+    def build(self, parts):
+        # ms <-> frame conversion is exact at 8kHz (8 frames per ms)
+        seg = parts[0]
+        for part in parts[1:]:
+            seg = seg + part
+        self.assertEqual(seg.frame_rate, self.sample_rate)
+        return seg
+
+    def test_compresses_long_pauses_and_keeps_configurable_silence(self):
+        seg = self.build([
+            self.silence(600), self.tone, self.silence(2000), self.tone,
+            self.silence(1500), self.tone, self.silence(700),
+        ])
+        out, mapping = compress_silence(
+            seg, min_silence_len=500, silence_thresh=-40,
+            keep_silence=100, crossfade=0)
+
+        # each long pause keeps 100ms on each side: 2000 -> 200, 1500 -> 200
+        self.assertEqual(len(out), len(seg) - (2000 - 200) - (1500 - 200))
+        removed = [m for m in mapping if m[2] == m[3]]
+        self.assertEqual(removed, [
+            (1000, 2800, 1000, 1000),
+            (3300, 4600, 1500, 1500),
+        ])
+
+    def test_mapping_covers_whole_timeline_in_order(self):
+        seg = self.build([
+            self.tone, self.silence(1200), self.tone,
+            self.silence(900), self.tone,
+        ])
+        out, mapping = compress_silence(
+            seg, min_silence_len=500, silence_thresh=-40,
+            keep_silence=100, crossfade=0)
+
+        self.assertEqual(mapping[0][0], 0)
+        self.assertEqual(mapping[-1][1], len(seg))
+        for earlier, later in zip(mapping, mapping[1:]):
+            self.assertEqual(earlier[1], later[0])
+        # destination spans the whole output
+        self.assertEqual(max(m[3] for m in mapping), len(out))
+
+    def test_hard_splice_is_sample_exact(self):
+        seg = self.build([
+            self.tone, self.silence(1500), self.tone,
+            self.silence(1000), self.tone,
+        ])
+        out, mapping = compress_silence(
+            seg, min_silence_len=500, silence_thresh=-40,
+            keep_silence=100, crossfade=0)
+
+        # every kept section appears byte-for-byte unchanged in the output
+        for src_start, src_end, dst_start, dst_end in mapping:
+            if dst_end > dst_start:
+                self.assertEqual(
+                    out[dst_start:dst_end].raw_data,
+                    seg[src_start:src_end].raw_data)
+
+        # no frame lost: surviving frames plus removed frames equal the input
+        removed_frames = sum(
+            int(seg.frame_count(ms=src_end - src_start))
+            for src_start, src_end, dst_start, dst_end in mapping
+            if dst_start == dst_end)
+        self.assertEqual(
+            int(out.frame_count()) + removed_frames, int(seg.frame_count()))
+
+    def test_nonsilent_sample_order_is_preserved(self):
+        seg = self.build([
+            self.tone, self.silence(1500),
+            Sine(660, sample_rate=self.sample_rate).to_audio_segment(
+                duration=250, volume=-6),
+            self.silence(1000), self.tone,
+        ])
+        out, mapping = compress_silence(
+            seg, min_silence_len=500, silence_thresh=-40,
+            keep_silence=50, crossfade=0)
+
+        kept = [m for m in mapping if m[2] < m[3]]
+        # source and destination order are identical
+        self.assertEqual([m[0] for m in kept], sorted(m[0] for m in kept))
+        self.assertEqual([m[2] for m in kept], sorted(m[2] for m in kept))
+        # the distinct 660Hz block is still found between the 440Hz blocks
+        for src_start, src_end, dst_start, dst_end in kept:
+            self.assertEqual(
+                out[dst_start:dst_end].raw_data,
+                seg[src_start:src_end].raw_data)
+
+    def test_crossfade_shortens_output_without_clipping(self):
+        seg = self.build([
+            self.tone, self.silence(1500), self.tone,
+            self.silence(1000), self.tone,
+        ])
+        hard, _ = compress_silence(
+            seg, min_silence_len=500, silence_thresh=-40,
+            keep_silence=100, crossfade=0)
+        faded, mapping = compress_silence(
+            seg, min_silence_len=500, silence_thresh=-40,
+            keep_silence=100, crossfade=20)
+
+        # two splices, each overlapping by the 20ms crossfade
+        self.assertEqual(len(faded), len(hard) - 2 * 20)
+        max_sample = max(abs(v) for v in faded.get_array_of_samples())
+        self.assertLessEqual(max_sample, 32767)
+        # crossfaded kept sections overlap in the destination: consecutive
+        # kept sections are adjacent in the source but overlap in the output
+        kept = [m for m in mapping if m[2] < m[3]]
+        overlaps = [
+            later[2] - earlier[3]
+            for earlier, later in zip(kept, kept[1:])]
+        self.assertTrue(overlaps)
+        self.assertTrue(all(overlap < 0 for overlap in overlaps))
+        self.assertEqual([-overlap for overlap in overlaps], [20, 20])
+
+    def test_crossfade_is_clamped_when_longer_than_pieces(self):
+        seg = self.build([
+            self.tone[:100], self.silence(800), self.tone[:100]])
+        # pieces are 120ms each; a 500ms crossfade is clamped to 60ms
+        out, mapping = compress_silence(
+            seg, min_silence_len=300, silence_thresh=-40,
+            keep_silence=20, crossfade=500)
+        self.assertEqual(len(out), 120 + 120 - 60)
+
+    def test_all_silent_segment_is_returned_unchanged(self):
+        seg = self.silence(3000)
+        out, mapping = compress_silence(seg)
+        self.assertIs(out, seg)
+        self.assertEqual(mapping, [(0, 3000, 0, 3000)])
+
+    def test_segment_without_silence_is_returned_unchanged(self):
+        out, mapping = compress_silence(
+            self.tone, min_silence_len=500, silence_thresh=-40)
+        self.assertIs(out, self.tone)
+        self.assertEqual(mapping, [(0, 300, 0, 300)])
+
+    def test_silence_shorter_than_threshold_is_untouched(self):
+        # 250ms gaps never register as silence at min_silence_len=500
+        seg = self.build([
+            self.tone, self.silence(250), self.tone,
+            self.silence(250), self.tone])
+        out, mapping = compress_silence(
+            seg, min_silence_len=500, silence_thresh=-40, keep_silence=100)
+        self.assertIs(out, seg)
+        self.assertEqual(mapping, [(0, len(seg), 0, len(seg))])
+
+    def test_leading_and_trailing_silence_are_preserved(self):
+        seg = self.build([
+            self.silence(900), self.tone, self.silence(1500),
+            self.tone, self.silence(800)])
+        out, mapping = compress_silence(
+            seg, min_silence_len=500, silence_thresh=-40,
+            keep_silence=100, crossfade=0)
+
+        kept = [m for m in mapping if m[2] < m[3]]
+        # the first kept section starts at zero and the last ends at the
+        # full source length: edge silence is never trimmed
+        self.assertEqual(kept[0][0], 0)
+        self.assertEqual(kept[-1][1], len(seg))
+        # only the inner 1500ms pause was cut (down to 200ms)
+        removed = [m for m in mapping if m[2] == m[3]]
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0][1] - removed[0][0], 1500 - 200)
+        self.assertEqual(len(out), len(seg) - (1500 - 200))
+
+    def test_consecutive_pauses_are_all_compressed(self):
+        seg = self.build([
+            self.tone, self.silence(600), self.tone,
+            self.silence(900), self.tone])
+        out, mapping = compress_silence(
+            seg, min_silence_len=300, silence_thresh=-40,
+            keep_silence=100, crossfade=0)
+        removed = [m for m in mapping if m[2] == m[3]]
+        self.assertEqual(len(removed), 2)
+        self.assertEqual([r[0] for r in removed], sorted(r[0] for r in removed))
+        self.assertEqual(
+            len(out), len(seg) - (600 - 200) - (900 - 200))
+
+    def test_gap_shorter_than_twice_keep_silence_is_kept_whole(self):
+        seg = self.build([self.tone, self.silence(300), self.tone])
+        out, mapping = compress_silence(
+            seg, min_silence_len=100, silence_thresh=-40,
+            keep_silence=200, crossfade=0)
+        # 300ms gap cannot fit 2 * 200ms of padding, so nothing is cut
+        self.assertIs(out, seg)
+        self.assertEqual(mapping, [(0, len(seg), 0, len(seg))])
+
+    def test_empty_segment_has_identity_mapping(self):
+        empty = AudioSegment.empty()
+        out, mapping = compress_silence(empty)
+        self.assertIs(out, empty)
+        self.assertEqual(mapping, [(0, 0, 0, 0)])
+
+    def test_channels_sample_rate_and_bit_depth_are_preserved(self):
+        seg = self.build([
+            self.tone, self.silence(1200), self.tone])
+        wide = seg.set_channels(2).set_frame_rate(16000).set_sample_width(4)
+        out, _ = compress_silence(
+            wide, min_silence_len=500, silence_thresh=-40,
+            keep_silence=100, crossfade=10)
+        self.assertEqual(out.channels, 2)
+        self.assertEqual(out.frame_rate, 16000)
+        self.assertEqual(out.sample_width, 4)
+
+    def test_invalid_dbfs_thresholds_raise(self):
+        seg = self.build([self.tone, self.silence(800), self.tone])
+        for bad_threshold in (1.0, float('nan'), float('inf'), "-40", True):
+            with self.assertRaises(InvalidThreshold):
+                compress_silence(seg, silence_thresh=bad_threshold)
+
+    def test_boundary_dbfs_values_are_accepted(self):
+        seg = self.build([self.tone, self.silence(800), self.tone])
+        # -infinity: nothing qualifies as silence, identity result
+        out_inf, mapping_inf = compress_silence(
+            seg, silence_thresh=float('-inf'))
+        self.assertEqual(mapping_inf, [(0, len(seg), 0, len(seg))])
+        # negative zero is a valid threshold
+        out_zero, mapping_zero = compress_silence(
+            seg, min_silence_len=300, silence_thresh=-0.0,
+            keep_silence=20, crossfade=10)
+        self.assertEqual(mapping_zero, [(0, len(seg), 0, len(seg))])
+        self.assertEqual(len(out_zero), len(seg))
+
+    def test_invalid_durations_raise(self):
+        seg = self.build([self.tone, self.silence(800), self.tone])
+        for kwargs in (
+            dict(min_silence_len=0),
+            dict(min_silence_len=-1),
+            dict(seek_step=0),
+            dict(keep_silence=-1),
+            dict(crossfade=-1),
+        ):
+            with self.assertRaises(InvalidDuration):
+                compress_silence(seg, **kwargs)
+
+    def test_effect_method_returns_only_the_segment(self):
+        seg = self.build([
+            self.tone, self.silence(1500), self.tone])
+        out, mapping = compress_silence(
+            seg, min_silence_len=500, silence_thresh=-40,
+            keep_silence=100, crossfade=10)
+        self.assertEqual(
+            seg.compress_silence_effect(
+                min_silence_len=500, silence_thresh=-40,
+                keep_silence=100, crossfade=10),
+            out)
+
+    def test_low_noise_sample_seam_and_length(self):
+        # seeded low-amplitude noise with deterministic loud pulses; 8kHz
+        # keeps the ms/frame mapping exact for sample-level seam checks
+        import random
+        random.seed(42)
+        noise = WhiteNoise(sample_rate=self.sample_rate).to_audio_segment(
+            duration=3000, volume=-50)
+        pulse = Sine(880, sample_rate=self.sample_rate).to_audio_segment(
+            duration=400, volume=-6)
+        seg = self.build([
+            noise[:500], pulse, noise[:1500], pulse, noise[:600]])
+
+        hard, hard_mapping = compress_silence(
+            seg, min_silence_len=800, silence_thresh=-30,
+            keep_silence=100, crossfade=0)
+        faded, _ = compress_silence(
+            seg, min_silence_len=800, silence_thresh=-30,
+            keep_silence=100, crossfade=15)
+
+        # one long pause, one splice with a 15ms crossfade
+        self.assertEqual(len(faded), len(hard) - 15)
+        # hard splice copies the surviving samples verbatim
+        for src_start, src_end, dst_start, dst_end in hard_mapping:
+            if dst_end > dst_start:
+                self.assertEqual(
+                    hard[dst_start:dst_end].raw_data,
+                    seg[src_start:src_end].raw_data)
+        # no clipping introduced at the seam
+        self.assertLessEqual(
+            max(abs(v) for v in faded.get_array_of_samples()), 32767)
 
 
 class GeneratorTests(unittest.TestCase):

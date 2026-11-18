@@ -1,3 +1,6 @@
+# Unreleased
+- Add `pydub.silence.compress_silence()` to shorten over-long silent pauses while keeping configurable padding and crossfades; returns the compressed `AudioSegment` together with a source-time to new-time mapping (also available as the `AudioSegment.compress_silence_effect()` effect)
+
 # v0.25.1
 - Fix crashing bug in new scipy-powered EQ effects
 
