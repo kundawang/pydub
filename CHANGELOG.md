@@ -1,3 +1,6 @@
+# Unreleased
+- Add automatic mains hum removal: `AudioSegment.detect_hum()` finds stable narrow-band peaks at the 50/60 Hz candidates and their low-order harmonics, and `AudioSegment.remove_hum(strength=...)` notches them out with adjustable strength. `pydub.effects.HumFilter` keeps per-channel filter state so long recordings can be processed in chunks with results identical to one-shot processing
+
 # v0.25.1
 - Fix crashing bug in new scipy-powered EQ effects
 

@@ -612,6 +612,77 @@ Collection of DSP effects that are implemented by `AudioSegment` objects.
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
 
+### AudioSegment(…).remove_hum()
+
+Detects mains hum (50 or 60 Hz and its low-order harmonics) and removes it with narrow-band notch filters - useful for interview recordings with a constant power-line buzz, where a broad low-frequency cut would also weaken the voice. When no hum is detected the audio is returned unchanged.
+
+```python
+from pydub import AudioSegment
+
+interview = AudioSegment.from_file("interview.wav")
+cleaned = interview.remove_hum(strength=0.8)
+```
+
+**Supported keyword arguments**:
+
+- `strength` | example: `0.5` | default: `1.0`
+  How strongly the detected hum frequencies are suppressed: `0.0` leaves the audio untouched, `1.0` applies the full notch. Values outside `[0.0, 1.0]` raise `ValueError`.
+
+- `candidates` | example: `(50.0,)` | default: `(50.0, 60.0)`
+  Mains frequencies to test. At most one candidate family is removed: when more than one qualifies, the stronger hum wins.
+
+- `max_harmonic` | example: `3` | default: `5`
+  Highest harmonic of each candidate to consider (e.g. 5 means up to 250/300 Hz).
+
+- `q` | example: `15.0` | default: `30.0`
+  Quality factor of the notch filters; higher means narrower.
+
+Additional keyword arguments are passed on to `pydub.effects.detect_hum()`.
+
+### AudioSegment(…).detect_hum()
+
+Returns a sorted list of the detected hum frequencies in Hz (the fundamental plus the low-order harmonics found), or an empty list when there is no stable narrow-band hum - for example when the segment is too short, is silent, or its frame rate is too low to represent the candidates.
+
+```python
+from pydub import AudioSegment
+
+AudioSegment.from_file("interview.wav").detect_hum()
+# [50.0, 100.0, 150.0]
+```
+
+**Supported keyword arguments**:
+
+- `candidates` | example: `(50.0,)` | default: `(50.0, 60.0)`
+  Mains frequencies to test.
+
+- `max_harmonic` | example: `3` | default: `5`
+  Highest harmonic of each candidate to consider.
+
+- `min_prominence_db` | example: `10.0` | default: `8.0`
+  How far a peak must stand above the neighboring spectrum to count as a stable narrow-band peak.
+
+- `min_level_dbfs` | example: `-40.0` | default: `-50.0`
+  Peaks quieter than this are ignored, so silence and quiet noise floors never trigger detection.
+
+- `max_analysis_ms` | example: `5000` | default: `2000`
+  At most this much audio is analyzed.
+
+- `min_analysis_ms` | example: `500` | default: `200`
+  Segments shorter than this cannot be analyzed reliably and always return an empty list.
+
+For streaming use, `pydub.effects.HumFilter` applies the same notch filters while keeping its state per channel, so processing a long recording in consecutive chunks gives exactly the same result as processing it in one pass:
+
+```python
+from pydub import AudioSegment
+from pydub.effects import HumFilter, detect_hum
+from pydub.utils import make_chunks
+
+seg = AudioSegment.from_file("long_interview.wav")
+hum_filter = HumFilter(detect_hum(seg), frame_rate=seg.frame_rate,
+                       channels=seg.channels, sample_width=seg.sample_width)
+cleaned = [hum_filter.process(chunk) for chunk in make_chunks(seg, 1000)]
+```
+
 ## Silence
 
 Various functions for finding/manipulating silence in AudioSegments. For creating silent AudioSegments, see AudioSegment.silent().

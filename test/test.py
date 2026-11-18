@@ -1,4 +1,5 @@
 from functools import partial
+import math
 import os
 import sys
 import unittest
@@ -39,6 +40,12 @@ from pydub.generators import (
     Triangle,
     Sawtooth,
     WhiteNoise,
+)
+from pydub.effects import (
+    HumFilter,
+    _goertzel_power,
+    detect_hum,
+    remove_hum,
 )
 
 data_dir = os.path.join(os.path.dirname(__file__), 'data')
@@ -1086,7 +1093,7 @@ class AudioSegmentTests(unittest.TestCase):
             tmp_wav_file.flush()
             self.assertRaises(CouldntDecodeError, AudioSegment.from_file, tmp_wav_file.name)
             files = os.listdir(tempfile.tempdir)
-            self.assertEquals(files, [os.path.basename(tmp_wav_file.name)])
+            self.assertEqual(files, [os.path.basename(tmp_wav_file.name)])
 
         if sys.platform == 'win32':
             os.remove(tmp_wav_file.name)
@@ -1109,7 +1116,7 @@ class SilenceTests(unittest.TestCase):
 
     def test_split_on_silence_complete_silence(self):
         seg = AudioSegment.silent(5000)
-        self.assertEquals( split_on_silence(seg), [] )
+        self.assertEqual( split_on_silence(seg), [] )
 
     def test_split_on_silence_test1(self):
         self.assertEqual(
@@ -1329,6 +1336,191 @@ class FilterTests(unittest.TestCase):
         s = Sine(100).to_audio_segment()
         less_treble = s.low_pass_filter(800)
         self.assertAlmostEqual(less_treble.dBFS, s.dBFS, places=0)
+
+
+class HumRemovalTests(unittest.TestCase):
+
+    @staticmethod
+    def voice_like(duration=1000, sample_rate=44100):
+        # a stand-in for speech: a few harmonically related tones, none of
+        # them near 50/60 Hz or their low harmonics
+        seg = Sine(220, sample_rate=sample_rate).to_audio_segment(
+            duration=duration, volume=-12.0)
+        seg = seg.overlay(Sine(440, sample_rate=sample_rate).to_audio_segment(
+            duration=duration, volume=-18.0))
+        seg = seg.overlay(Sine(880, sample_rate=sample_rate).to_audio_segment(
+            duration=duration, volume=-24.0))
+        return seg
+
+    @classmethod
+    def voice_with_hum(cls, hum_freq, hum_volume=-16.0, duration=1000,
+                       sample_rate=44100, harmonics=(2, 3)):
+        seg = cls.voice_like(duration=duration, sample_rate=sample_rate)
+        seg = seg.overlay(Sine(hum_freq, sample_rate=sample_rate)
+                          .to_audio_segment(duration=duration,
+                                            volume=hum_volume))
+        for k in harmonics:
+            seg = seg.overlay(Sine(hum_freq * k, sample_rate=sample_rate)
+                              .to_audio_segment(duration=duration,
+                                                volume=hum_volume - 6.0))
+        return seg
+
+    @staticmethod
+    def band_power_dbfs(seg, freq):
+        mono = seg.set_channels(1)
+        samples = [s / float(mono.max_possible_amplitude)
+                   for s in mono.get_array_of_samples()]
+        power = _goertzel_power(samples, mono.frame_rate, freq)
+        amplitude = 2.0 * math.sqrt(power) / len(samples) if power else 0.0
+        return (20.0 * math.log10(amplitude)
+                if amplitude > 0.0 else float('-inf'))
+
+    def test_detect_50hz_hum(self):
+        seg = self.voice_with_hum(50)
+        freqs = detect_hum(seg)
+        self.assertEqual(freqs[0], 50.0)
+        self.assertIn(100.0, freqs)
+        self.assertIn(150.0, freqs)
+        self.assertNotIn(60.0, freqs)
+
+    def test_detect_60hz_hum(self):
+        seg = self.voice_with_hum(60)
+        freqs = detect_hum(seg)
+        self.assertEqual(freqs[0], 60.0)
+        self.assertIn(120.0, freqs)
+        self.assertIn(180.0, freqs)
+        self.assertNotIn(50.0, freqs)
+
+    def test_detect_hum_is_available_as_method(self):
+        seg = self.voice_with_hum(50)
+        self.assertEqual(seg.detect_hum(), detect_hum(seg))
+
+    def test_remove_hum_attenuates_hum_bands(self):
+        seg = self.voice_with_hum(50)
+        cleaned = remove_hum(seg)
+        # measure on the second half, after the notch filters have settled
+        for freq in (50, 100, 150):
+            before = self.band_power_dbfs(seg[500:], freq)
+            after = self.band_power_dbfs(cleaned[500:], freq)
+            self.assertGreater(before - after, 20.0,
+                               "%s Hz only attenuated by %.1f dB"
+                               % (freq, before - after))
+
+    def test_remove_hum_preserves_voice_bands(self):
+        seg = self.voice_with_hum(50)
+        cleaned = remove_hum(seg)
+        for freq in (220, 440, 880):
+            before = self.band_power_dbfs(seg, freq)
+            after = self.band_power_dbfs(cleaned, freq)
+            self.assertAlmostEqual(before, after, delta=1.0)
+
+    def test_remove_hum_without_hum_leaves_pcm_unchanged(self):
+        seg = self.voice_like()
+        cleaned = remove_hum(seg)
+        self.assertEqual(cleaned.raw_data, seg.raw_data)
+
+    def test_remove_hum_on_silence(self):
+        seg = AudioSegment.silent(duration=1000, frame_rate=44100)
+        self.assertEqual(detect_hum(seg), [])
+        cleaned = remove_hum(seg)
+        self.assertEqual(cleaned.raw_data, seg.raw_data)
+
+    def test_remove_hum_on_short_segment(self):
+        # too short to reliably tell 50 and 60 Hz apart: no detection,
+        # no modification
+        seg = self.voice_with_hum(50, duration=100)
+        self.assertEqual(detect_hum(seg), [])
+        cleaned = remove_hum(seg)
+        self.assertEqual(cleaned.raw_data, seg.raw_data)
+
+    def test_remove_hum_on_low_sample_rate(self):
+        # 50/60 Hz are above the Nyquist frequency of this segment
+        seg = Sine(30, sample_rate=90).to_audio_segment(duration=1000,
+                                                        volume=-16.0)
+        self.assertEqual(detect_hum(seg), [])
+        cleaned = remove_hum(seg)
+        self.assertEqual(cleaned.raw_data, seg.raw_data)
+
+    def test_remove_hum_rejects_invalid_strength(self):
+        seg = self.voice_with_hum(50)
+        self.assertRaises(ValueError, remove_hum, seg, strength=1.5)
+        self.assertRaises(ValueError, remove_hum, seg, strength=-0.5)
+        self.assertRaises(ValueError, HumFilter, [50.0],
+                          frame_rate=44100, strength=2.0)
+
+    def test_remove_hum_zero_strength_leaves_pcm_unchanged(self):
+        seg = self.voice_with_hum(50)
+        cleaned = remove_hum(seg, strength=0.0)
+        self.assertEqual(cleaned.raw_data, seg.raw_data)
+
+    def test_remove_hum_partial_strength(self):
+        seg = self.voice_with_hum(50)
+        before = self.band_power_dbfs(seg[500:], 50)
+        half = self.band_power_dbfs(remove_hum(seg, strength=0.5)[500:], 50)
+        full = self.band_power_dbfs(remove_hum(seg, strength=1.0)[500:], 50)
+        self.assertGreater(before - half, 3.0)
+        self.assertGreater(before - full, before - half)
+
+    def test_remove_hum_on_stereo(self):
+        seg = self.voice_with_hum(60).set_channels(2)
+        freqs = detect_hum(seg)
+        self.assertEqual(freqs[0], 60.0)
+        cleaned = remove_hum(seg)
+        self.assertEqual(cleaned.channels, 2)
+        self.assertGreater(self.band_power_dbfs(seg[500:], 60)
+                           - self.band_power_dbfs(cleaned[500:], 60), 20.0)
+
+    def test_two_close_hum_frequencies_pick_the_stronger(self):
+        seg = self.voice_like()
+        seg = seg.overlay(Sine(50).to_audio_segment(volume=-30.0))
+        seg = seg.overlay(Sine(60).to_audio_segment(volume=-12.0))
+        freqs = detect_hum(seg)
+        self.assertEqual(freqs[0], 60.0)
+        self.assertNotIn(50.0, freqs)
+
+    def test_uncertain_detection_returns_no_hum(self):
+        # broadband noise has no stable narrow-band peaks
+        seg = WhiteNoise().to_audio_segment(duration=1000, volume=-20.0)
+        self.assertEqual(detect_hum(seg), [])
+        cleaned = remove_hum(seg)
+        self.assertEqual(cleaned.raw_data, seg.raw_data)
+
+    def test_chunked_processing_matches_one_shot(self):
+        seg = self.voice_with_hum(50, duration=2000)
+        freqs = detect_hum(seg)
+        self.assertTrue(freqs)
+
+        one_shot = HumFilter(freqs, frame_rate=seg.frame_rate,
+                             channels=seg.channels,
+                             sample_width=seg.sample_width).process(seg)
+
+        chunked_filter = HumFilter(freqs, frame_rate=seg.frame_rate,
+                                   channels=seg.channels,
+                                   sample_width=seg.sample_width)
+        chunked = b''.join(chunked_filter.process(chunk).raw_data
+                           for chunk in make_chunks(seg, 300))
+
+        self.assertEqual(len(chunked), len(one_shot.raw_data))
+        self.assertEqual(chunked, one_shot.raw_data)
+
+    def test_hum_filter_rejects_mismatched_segments(self):
+        hum_filter = HumFilter([50.0], frame_rate=44100, channels=1,
+                               sample_width=2)
+        seg = self.voice_with_hum(50)
+        self.assertRaises(ValueError, hum_filter.process,
+                          seg.set_frame_rate(22050))
+        self.assertRaises(ValueError, hum_filter.process,
+                          seg.set_channels(2))
+
+    def test_remove_hum_export(self):
+        seg = self.voice_with_hum(50)
+        cleaned = remove_hum(seg)
+        exported = cleaned.export(format='wav')
+        reread = AudioSegment.from_wav(exported)
+        self.assertEqual(len(reread), len(cleaned))
+        self.assertEqual(reread.channels, cleaned.channels)
+        self.assertEqual(reread.frame_rate, cleaned.frame_rate)
+        self.assertGreater(reread.dBFS, -50.0)
 
 
 class PartialAudioSegmentLoadTests(unittest.TestCase):
