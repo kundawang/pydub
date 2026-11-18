@@ -339,3 +339,147 @@ def apply_gain_stereo(seg, left_gain=0.0, right_gain=0.0):
     return seg._spawn(data=output,
                 overrides={'channels': 2,
                            'frame_width': 2 * seg.sample_width})
+
+
+def _find_clipped_runs(chan, clip_level):
+    """
+    Return a list of (start, end) index pairs (end exclusive) of maximal
+    runs of samples whose absolute value reaches ``clip_level``.
+    """
+    runs = []
+    n = len(chan)
+    i = 0
+    while i < n:
+        sample = chan[i]
+        if sample >= clip_level or sample <= -clip_level:
+            start = i
+            while i < n and (chan[i] >= clip_level or chan[i] <= -clip_level):
+                i += 1
+            runs.append((start, i))
+        else:
+            i += 1
+    return runs
+
+
+def _interpolate_run(chan, start, end, min_val, max_val):
+    """
+    Estimate the ``end - start`` clipped samples of one channel using a
+    cubic Hermite spline anchored on the unclipped samples on either side
+    of the run (with tangents from finite differences of the surrounding
+    unclipped samples). Results are clamped to the sample format's range
+    so repaired peaks can never exceed full scale.
+    """
+    run = end - start
+    interval = run + 1  # distance (in samples) between the two anchors
+    n = len(chan)
+
+    p0 = chan[start - 1]
+    p1 = chan[end]
+
+    # tangents: per-sample slope at each anchor, scaled to the interval
+    if start >= 2:
+        m0 = (chan[start - 1] - chan[start - 2]) * interval
+    else:
+        m0 = p1 - p0
+    if end + 1 < n:
+        m1 = (chan[end + 1] - chan[end]) * interval
+    else:
+        m1 = p1 - p0
+
+    repaired = []
+    for i in range(1, run + 1):
+        t = i / interval
+        t2 = t * t
+        t3 = t2 * t
+        h00 = 2 * t3 - 3 * t2 + 1
+        h10 = t3 - 2 * t2 + t
+        h01 = -2 * t3 + 3 * t2
+        h11 = t3 - t2
+        value = h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1
+        value = int(round(value))
+        if value > max_val:
+            value = max_val
+        elif value < min_val:
+            value = min_val
+        repaired.append(value)
+    return repaired
+
+
+@register_pydub_effect
+def declip(seg, threshold=0.999, max_clip_ms=15.0):
+    """
+    Repair clipped (flat-topped / "square waved") samples caused by
+    recording past full scale.
+
+    Each channel is scanned independently for contiguous runs of samples
+    at (or beyond) ``threshold`` of full scale. Runs that are short enough
+    (at most ``max_clip_ms`` milliseconds) and do not touch either end of
+    the segment are replaced with values estimated by cubic Hermite
+    interpolation between the unclipped samples surrounding the run.
+
+    threshold - fraction of full scale (0, 1] at or above which samples
+        are considered clipped (default 0.999)
+    max_clip_ms - maximum length, in milliseconds, of a clipped run that
+        will be repaired; longer runs are left untouched (default 15.0)
+
+    Returns a tuple ``(repaired_segment, repairs)`` where ``repairs`` is a
+    list of dicts, one per repaired run::
+
+        {"channel": 0, "start_sample": 120, "end_sample": 128,
+         "start_ms": 2.72, "end_ms": 2.90}
+
+    (``end_sample``/``end_ms`` are exclusive). Unclipped samples are left
+    byte-identical, and the duration, frame rate, sample width and channel
+    count of the segment are unchanged.
+
+    Clipped runs that are longer than ``max_clip_ms``, or that touch the
+    beginning or end of the segment (e.g. a recording that starts or ends
+    mid-clip, or a constant full-scale signal), cannot be interpolated
+    reliably and are returned unmodified and unreported.
+    """
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        raise ValueError("threshold must be a number in the range (0, 1]")
+    if not 0.0 < threshold <= 1.0:
+        raise ValueError("threshold must be in the range (0, 1]")
+
+    try:
+        max_clip_ms = float(max_clip_ms)
+    except (TypeError, ValueError):
+        raise ValueError("max_clip_ms must be a positive number")
+    if not max_clip_ms > 0.0:
+        raise ValueError("max_clip_ms must be a positive number")
+
+    min_val, max_val = get_min_max_value(seg.sample_width * 8)
+    clip_level = threshold * max_val
+
+    max_run = max(1, int(round(seg.frame_rate * max_clip_ms / 1000.0)))
+
+    samples = seg.get_array_of_samples()
+    out = array.array(samples.typecode, samples)
+
+    n_channels = seg.channels
+    n = len(samples) // n_channels
+
+    repairs = []
+    for channel_i in xrange(n_channels):
+        chan = samples[channel_i::n_channels]
+        for start, end in _find_clipped_runs(chan, clip_level):
+            run = end - start
+            # runs touching either end, or too long to estimate, are
+            # left untouched
+            if start == 0 or end == n or run > max_run:
+                continue
+            repaired = _interpolate_run(chan, start, end, min_val, max_val)
+            for offset, value in enumerate(repaired):
+                out[(start + offset) * n_channels + channel_i] = value
+            repairs.append({
+                "channel": channel_i,
+                "start_sample": start,
+                "end_sample": end,
+                "start_ms": start * 1000.0 / seg.frame_rate,
+                "end_ms": end * 1000.0 / seg.frame_rate,
+            })
+
+    return seg._spawn(out), repairs

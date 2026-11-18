@@ -1,4 +1,5 @@
 from functools import partial
+import array
 import os
 import sys
 import unittest
@@ -1394,6 +1395,181 @@ class PartialAudioSegmentLoadTests(unittest.TestCase):
         partial_seg2 = AudioSegment.from_file(self.raw_path_str, format="raw", sample_width=2, frame_rate=32000, channels=2, start_second=1., duration=1.)
         self.assertEqual(len(partial_seg1), len(partial_seg2))
         self.assertEqual(partial_seg1._data, partial_seg2._data)
+
+
+class DeclipTests(unittest.TestCase):
+
+    @staticmethod
+    def _hard_clip(seg, clip_at):
+        """Flatten every sample whose magnitude exceeds ``clip_at``."""
+        samples = seg.get_array_of_samples()
+        clipped = array.array(samples.typecode, (
+            max(-clip_at, min(clip_at, s)) for s in samples
+        ))
+        return seg._spawn(clipped)
+
+    @staticmethod
+    def _damaged_indexes(repairs, channels):
+        damaged = set()
+        for r in repairs:
+            for i in range(r["start_sample"], r["end_sample"]):
+                damaged.add(i * channels + r["channel"])
+        return damaged
+
+    def setUp(self):
+        self.max_val = 32767
+        self.sine = Sine(440).to_audio_segment(duration=200, volume=-1.0)
+        self.speech = AudioSegment.from_file(
+            os.path.join(data_dir, "test1.wav"))
+
+    def test_clipped_sine_intervals_and_error(self):
+        clip_at = int(self.max_val * 0.6)
+        clipped = self._hard_clip(self.sine, clip_at)
+        repaired, repairs = clipped.declip(
+            threshold=(clip_at - 1) / self.max_val)
+
+        # every clipped run of the input was found and repaired
+        self.assertTrue(len(repairs) > 0)
+        in_samples = clipped.get_array_of_samples()
+        expected_runs = 0
+        i = 0
+        while i < len(in_samples):
+            if abs(in_samples[i]) >= clip_at:
+                expected_runs += 1
+                while i < len(in_samples) and abs(in_samples[i]) >= clip_at:
+                    i += 1
+            else:
+                i += 1
+        self.assertEqual(len(repairs), expected_runs)
+
+        # reported intervals match the flat runs of the clipped input
+        for r in repairs:
+            self.assertEqual(r["channel"], 0)
+            for i in range(r["start_sample"], r["end_sample"]):
+                self.assertGreaterEqual(abs(in_samples[i]), clip_at)
+            self.assertLess(abs(in_samples[r["start_sample"] - 1]), clip_at)
+            self.assertLess(abs(in_samples[r["end_sample"]]), clip_at)
+            self.assertAlmostEqual(
+                r["end_ms"] - r["start_ms"],
+                (r["end_sample"] - r["start_sample"]) * 1000.0 / 44100)
+
+        # repaired samples approximate the original sine
+        orig = self.sine.get_array_of_samples()
+        out = repaired.get_array_of_samples()
+        errors = [abs(out[i] - orig[i])
+                  for i in self._damaged_indexes(repairs, 1)]
+        self.assertLess(max(errors), self.max_val * 0.05)
+        self.assertLess(sum(errors) / len(errors), self.max_val * 0.02)
+
+    def test_clipped_speech_undamaged_region_and_format(self):
+        clip_at = int(self.max_val * 0.5)
+        clipped = self._hard_clip(self.speech, clip_at)
+        repaired, repairs = clipped.declip(
+            threshold=(clip_at - 1) / self.max_val)
+
+        self.assertTrue(len(repairs) > 0)
+
+        # duration and format are unchanged
+        self.assertEqual(len(repaired), len(clipped))
+        self.assertEqual(repaired.frame_rate, clipped.frame_rate)
+        self.assertEqual(repaired.sample_width, clipped.sample_width)
+        self.assertEqual(repaired.channels, clipped.channels)
+
+        # samples outside the repaired intervals are byte-identical
+        in_samples = clipped.get_array_of_samples()
+        out = repaired.get_array_of_samples()
+        damaged = self._damaged_indexes(repairs, clipped.channels)
+        for i in range(len(in_samples)):
+            if i not in damaged:
+                self.assertEqual(out[i], in_samples[i])
+
+        # repaired peaks stay within full scale
+        self.assertLessEqual(max(abs(s) for s in out), self.max_val)
+
+        # repaired speech approximates the original recording
+        orig = self.speech.get_array_of_samples()
+        errors = [abs(out[i] - orig[i]) for i in damaged]
+        self.assertLess(sum(errors) / len(errors), self.max_val * 0.1)
+
+    def test_channels_processed_independently(self):
+        clip_at = int(self.max_val * 0.6)
+        loud = Sine(440).to_audio_segment(duration=200, volume=-1.0)
+        quiet = Sine(220).to_audio_segment(duration=200, volume=-30.0)
+        stereo = AudioSegment.from_mono_audiosegments(
+            self._hard_clip(loud, clip_at), quiet)
+        samples = stereo.get_array_of_samples()
+        # clip only the left channel
+        for i in range(0, len(samples), 2):
+            samples[i] = max(-clip_at, min(clip_at, samples[i]))
+        clipped = stereo._spawn(samples)
+
+        repaired, repairs = clipped.declip(
+            threshold=(clip_at - 1) / self.max_val)
+
+        self.assertTrue(len(repairs) > 0)
+        self.assertTrue(all(r["channel"] == 0 for r in repairs))
+        # right channel is byte-identical
+        in_samples = clipped.get_array_of_samples()
+        out = repaired.get_array_of_samples()
+        for i in range(1, len(samples), 2):
+            self.assertEqual(out[i], in_samples[i])
+
+    def test_silence_has_no_clipping(self):
+        silence = AudioSegment.silent(duration=100)
+        repaired, repairs = silence.declip()
+        self.assertEqual(repairs, [])
+        self.assertEqual(repaired._data, silence._data)
+
+    def test_constant_full_scale_is_untouched(self):
+        data = struct.pack("<h", self.max_val) * 4410
+        seg = AudioSegment(data, metadata={
+            "channels": 1, "sample_width": 2,
+            "frame_rate": 44100, "frame_width": 2,
+        })
+        repaired, repairs = seg.declip()
+        self.assertEqual(repairs, [])
+        self.assertEqual(repaired._data, seg._data)
+
+    def test_too_long_clip_is_untouched(self):
+        samples = array.array("h",
+                              [0] * 1000 + [self.max_val] * 2000 + [0] * 1000)
+        seg = AudioSegment(samples.tobytes(), metadata={
+            "channels": 1, "sample_width": 2,
+            "frame_rate": 44100, "frame_width": 2,
+        })
+        repaired, repairs = seg.declip(max_clip_ms=15.0)
+        self.assertEqual(repairs, [])
+        self.assertEqual(repaired._data, seg._data)
+
+    def test_clip_at_edges_is_untouched(self):
+        for clipped_part in ([self.max_val] * 50 + [0] * 1000,
+                             [0] * 1000 + [-self.max_val - 1] * 50):
+            seg = AudioSegment(array.array("h", clipped_part).tobytes(),
+                               metadata={
+                                   "channels": 1, "sample_width": 2,
+                                   "frame_rate": 44100, "frame_width": 2,
+                               })
+            repaired, repairs = seg.declip()
+            self.assertEqual(repairs, [])
+            self.assertEqual(repaired._data, seg._data)
+
+    def test_very_short_segment(self):
+        seg = AudioSegment(array.array("h", [0, self.max_val, 0]).tobytes(),
+                           metadata={
+                               "channels": 1, "sample_width": 2,
+                               "frame_rate": 44100, "frame_width": 2,
+                           })
+        repaired, repairs = seg.declip()
+        self.assertEqual(len(repaired.get_array_of_samples()), 3)
+        self.assertEqual(len(repaired), len(seg))
+
+    def test_invalid_threshold(self):
+        for bad in (0, -0.5, 1.5, "loud", None):
+            self.assertRaises(ValueError, self.sine.declip, threshold=bad)
+
+    def test_invalid_max_clip_ms(self):
+        for bad in (0, -1, "long", None):
+            self.assertRaises(ValueError, self.sine.declip, max_clip_ms=bad)
 
 
 if __name__ == "__main__":
