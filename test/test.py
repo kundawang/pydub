@@ -1,4 +1,5 @@
 from functools import partial
+import array
 import os
 import sys
 import unittest
@@ -1086,7 +1087,7 @@ class AudioSegmentTests(unittest.TestCase):
             tmp_wav_file.flush()
             self.assertRaises(CouldntDecodeError, AudioSegment.from_file, tmp_wav_file.name)
             files = os.listdir(tempfile.tempdir)
-            self.assertEquals(files, [os.path.basename(tmp_wav_file.name)])
+            self.assertEqual(files, [os.path.basename(tmp_wav_file.name)])
 
         if sys.platform == 'win32':
             os.remove(tmp_wav_file.name)
@@ -1109,7 +1110,7 @@ class SilenceTests(unittest.TestCase):
 
     def test_split_on_silence_complete_silence(self):
         seg = AudioSegment.silent(5000)
-        self.assertEquals( split_on_silence(seg), [] )
+        self.assertEqual( split_on_silence(seg), [] )
 
     def test_split_on_silence_test1(self):
         self.assertEqual(
@@ -1394,6 +1395,331 @@ class PartialAudioSegmentLoadTests(unittest.TestCase):
         partial_seg2 = AudioSegment.from_file(self.raw_path_str, format="raw", sample_width=2, frame_rate=32000, channels=2, start_second=1., duration=1.)
         self.assertEqual(len(partial_seg1), len(partial_seg2))
         self.assertEqual(partial_seg1._data, partial_seg2._data)
+
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
+
+
+@unittest.skipUnless(_HAS_NUMPY, "convolve effect requires numpy")
+class ConvolveTests(unittest.TestCase):
+    """
+    Tests for AudioSegment.convolve(), the convolution reverb effect.
+
+    The reference signals are built from explicit integer samples so the
+    expected outputs can be calculated by hand rather than by another
+    convolution implementation.
+    """
+
+    frame_rate = 8000
+    sample_width = 2
+    values = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000]
+
+    def setUp(self):
+        self.seg = AudioSegment(
+            array.array('h', self.values),
+            sample_width=self.sample_width,
+            frame_rate=self.frame_rate,
+            channels=1)
+        # full-scale unit impulse: [+full_scale, 0, 0] -> unity gain
+        self.identity_ir = AudioSegment(
+            array.array('h', [32767, 0, 0]),
+            sample_width=self.sample_width,
+            frame_rate=self.frame_rate,
+            channels=1)
+        # two-tap response: 0.5 gain taps two frames apart
+        self.two_tap_ir = AudioSegment(
+            array.array('h', [16384, 0, 16384]),
+            sample_width=self.sample_width,
+            frame_rate=self.frame_rate,
+            channels=1)
+        self.two_tap_expected = [
+            int(round(
+                0.5 * (self.values[k] if k < len(self.values) else 0)
+                + 0.5 * (self.values[k - 2] if k - 2 >= 0 else 0)))
+            for k in range(len(self.values) + 3 - 1)
+        ]
+
+    def _mono(self, values, frame_rate=None, sample_width=None):
+        typecode = {1: 'b', 2: 'h', 4: 'i'}[
+            sample_width or self.sample_width]
+        return AudioSegment(
+            array.array(typecode, values),
+            sample_width=sample_width or self.sample_width,
+            frame_rate=frame_rate or self.frame_rate,
+            channels=1)
+
+    # --- unit impulse -----------------------------------------------------
+
+    def test_unit_impulse_wet_only_is_identity(self):
+        out = self.seg.convolve(self.identity_ir, dry=0, wet=1)
+        self.assertEqual(out.get_array_of_samples().tolist(), self.values)
+
+    def test_unit_impulse_dry_only_is_identity(self):
+        out = self.seg.convolve(self.identity_ir, dry=1, wet=0)
+        self.assertEqual(out.get_array_of_samples().tolist(), self.values)
+
+    def test_unit_impulse_default_doubles_signal(self):
+        # dry=1 and wet=1 with an identity impulse yields 2x the signal
+        out = self.seg.convolve(self.identity_ir)
+        self.assertEqual(out.get_array_of_samples().tolist(),
+                         [2 * v for v in self.values])
+
+    def test_unit_impulse_tail_extends_with_silence(self):
+        out = self.seg.convolve(
+            self.identity_ir, dry=0, wet=1, include_tail=True)
+        self.assertEqual(int(out.frame_count()),
+                         int(self.seg.frame_count()) + 2)
+        self.assertEqual(out.get_array_of_samples().tolist(),
+                         self.values + [0, 0])
+
+    def test_no_tail_keeps_input_length(self):
+        out = self.seg.convolve(
+            self.two_tap_ir, dry=0, wet=1, include_tail=False)
+        self.assertEqual(int(out.frame_count()), int(self.seg.frame_count()))
+        self.assertEqual(len(out), len(self.seg))
+
+    # --- two-tap impulse response: numeric correctness --------------------
+
+    def test_two_tap_response_numeric_values_with_tail(self):
+        out = self.seg.convolve(
+            self.two_tap_ir, dry=0, wet=1, include_tail=True)
+        self.assertEqual(out.get_array_of_samples().tolist(),
+                         self.two_tap_expected)
+
+    def test_two_tap_response_duration(self):
+        out = self.seg.convolve(
+            self.two_tap_ir, dry=0, wet=1, include_tail=True)
+        expected_frames = len(self.values) + 3 - 1
+        self.assertEqual(int(out.frame_count()), expected_frames)
+        self.assertEqual(len(out),
+                         round(1000 * expected_frames / self.frame_rate))
+
+    def test_dry_wet_mix_is_linear_combination(self):
+        seg = self._mono([100, 200, 0, 0])
+        ir = self._mono([16384, 16384])  # [0.5, 0.5]
+        # wet convolution (first 4 frames): [50, 150, 100, 0]
+        # mix = 0.25 * dry + 0.5 * wet
+        out = seg.convolve(ir, dry=0.25, wet=0.5)
+        self.assertEqual(out.get_array_of_samples().tolist(),
+                         [50, 125, 50, 0])
+
+    def test_zero_dry_and_wet_is_silence(self):
+        out = self.seg.convolve(
+            self.two_tap_ir, dry=0, wet=0, include_tail=True)
+        self.assertEqual(int(out.frame_count()),
+                         len(self.values) + 3 - 1)
+        self.assertEqual(
+            max(abs(s) for s in out.get_array_of_samples()), 0)
+
+    # --- block-based vs one-shot convolution ------------------------------
+
+    def test_block_processing_matches_one_shot(self):
+        rng = np.random.default_rng(42)
+        signal = (rng.standard_normal(5000) * 20000).astype(np.int16).tolist()
+        ir_values = (rng.standard_normal(137) * 5000).astype(np.int16).tolist()
+        long_seg = self._mono(signal)
+        ir = self._mono(ir_values)
+
+        one_shot = long_seg.convolve(
+            ir, dry=0.5, wet=0.7, include_tail=True)
+        blocked = long_seg.convolve(
+            ir, dry=0.5, wet=0.7, include_tail=True, chunk_duration=73)
+
+        self.assertEqual(one_shot.frame_count(), blocked.frame_count())
+        a = np.asarray(one_shot.get_array_of_samples(), dtype=np.int64)
+        b = np.asarray(blocked.get_array_of_samples(), dtype=np.int64)
+        # same FFT kernel + pre-mix quantization => at most one LSB apart
+        self.assertLessEqual(int(np.max(np.abs(a - b))), 1)
+
+    def test_block_processing_with_ir_longer_than_block(self):
+        rng = np.random.default_rng(7)
+        signal = (rng.standard_normal(4000) * 15000).astype(np.int16).tolist()
+        ir_values = (rng.standard_normal(300) * 3000).astype(np.int16).tolist()
+        long_seg = self._mono(signal)
+        ir = self._mono(ir_values)
+
+        one_shot = long_seg.convolve(ir, include_tail=True)
+        blocked = long_seg.convolve(
+            ir, include_tail=True, chunk_duration=50)
+        a = np.asarray(one_shot.get_array_of_samples(), dtype=np.int64)
+        b = np.asarray(blocked.get_array_of_samples(), dtype=np.int64)
+        self.assertEqual(a.shape, b.shape)
+        self.assertLessEqual(int(np.max(np.abs(a - b))), 1)
+
+    def test_single_sample_chunk_does_not_crash(self):
+        out = self.seg.convolve(
+            self.two_tap_ir, dry=0, wet=1, include_tail=True,
+            chunk_duration=1)
+        self.assertEqual(out.get_array_of_samples().tolist(),
+                         self.two_tap_expected)
+
+    # --- channels ----------------------------------------------------------
+
+    def test_mono_ir_applied_to_every_stereo_channel(self):
+        stereo = AudioSegment.from_mono_audiosegments(
+            self.seg, self.seg)
+        out = stereo.convolve(self.identity_ir, dry=0, wet=1)
+        self.assertEqual(out.channels, 2)
+        self.assertEqual(int(out.frame_count()), int(self.seg.frame_count()))
+        samples = out.get_array_of_samples().tolist()
+        self.assertEqual(samples[0::2], self.values)
+        self.assertEqual(samples[1::2], self.values)
+
+    def test_stereo_ir_convolves_matching_channels(self):
+        stereo = AudioSegment.from_mono_audiosegments(
+            self.seg, self.seg)
+        stereo_ir = AudioSegment.from_mono_audiosegments(
+            self.identity_ir, self.two_tap_ir)
+        out = stereo.convolve(
+            stereo_ir, dry=0, wet=1, include_tail=True)
+        samples = out.get_array_of_samples().tolist()
+        self.assertEqual(samples[0::2], self.values + [0, 0])
+        self.assertEqual(samples[1::2], self.two_tap_expected)
+
+    def test_mono_ir_on_stereo_built_with_set_channels(self):
+        stereo = self.seg.set_channels(2)
+        out = stereo.convolve(self.identity_ir, dry=0, wet=1)
+        samples = out.get_array_of_samples().tolist()
+        self.assertEqual(samples[0::2], self.values)
+        self.assertEqual(samples[1::2], self.values)
+
+    def test_mismatched_channel_count_raises(self):
+        stereo = AudioSegment.from_mono_audiosegments(
+            self.seg, self.seg)
+        three_channel_ir = AudioSegment.from_mono_audiosegments(
+            self.identity_ir, self.identity_ir, self.identity_ir)
+        with self.assertRaises(ValueError):
+            stereo.convolve(three_channel_ir)
+
+    # --- error conditions --------------------------------------------------
+
+    def test_empty_impulse_response_raises(self):
+        empty = AudioSegment(
+            b'', metadata={"channels": 1, "sample_width": 2,
+                           "frame_rate": self.frame_rate,
+                           "frame_width": 2})
+        with self.assertRaises(ValueError):
+            self.seg.convolve(empty)
+
+    def test_non_audio_segment_impulse_response_raises(self):
+        with self.assertRaises(TypeError):
+            self.seg.convolve([1, 0, 0])
+
+    def test_invalid_dry_wet_ratios_raise(self):
+        for bad in (-0.1, 1.1, float('nan'), float('inf'), 'nope'):
+            with self.assertRaises(ValueError):
+                self.seg.convolve(self.identity_ir, dry=bad)
+            with self.assertRaises(ValueError):
+                self.seg.convolve(self.identity_ir, wet=bad)
+
+    def test_boundary_ratios_are_accepted(self):
+        # exactly 0.0 and 1.0 must be accepted
+        out = self.seg.convolve(self.identity_ir, dry=0.0, wet=1.0)
+        self.assertEqual(len(out), len(self.seg))
+        out = self.seg.convolve(self.identity_ir, dry=1.0, wet=0.0)
+        self.assertEqual(len(out), len(self.seg))
+
+    # --- silence, clipping, empty segment ---------------------------------
+
+    def test_all_silent_input_stays_silent(self):
+        silent = AudioSegment.silent(
+            duration=10, frame_rate=self.frame_rate).set_sample_width(2)
+        out = silent.convolve(self.two_tap_ir, include_tail=True)
+        self.assertEqual(
+            max(abs(s) for s in out.get_array_of_samples()), 0)
+        self.assertEqual(int(out.frame_count()),
+                         int(silent.frame_count()) + 2)
+
+    def test_silent_ir_produces_silence(self):
+        silent_ir = self._mono([0, 0, 0, 0])
+        out = self.seg.convolve(silent_ir, dry=0, wet=1, include_tail=True)
+        self.assertEqual(
+            max(abs(s) for s in out.get_array_of_samples()), 0)
+
+    def test_overload_saturates_without_wrapping(self):
+        max_positive = (1 << 15) - 1
+        min_negative = -(1 << 15)
+        loud = self._mono([max_positive] * 4)
+        out = loud.convolve(self.identity_ir, dry=1, wet=1)
+        self.assertEqual(out.get_array_of_samples().tolist(),
+                         [max_positive] * 4)
+
+        loud_negative = self._mono([min_negative] * 4)
+        out = loud_negative.convolve(self.identity_ir, dry=1, wet=1)
+        self.assertEqual(out.get_array_of_samples().tolist(),
+                         [min_negative] * 4)
+
+    def test_empty_segment_returned_with_zero_frames(self):
+        empty = self.seg[0:0]
+        out = empty.convolve(self.identity_ir)
+        self.assertEqual(int(out.frame_count()), 0)
+        self.assertEqual(out.channels, empty.channels)
+
+    # --- frame rate, sample width and export rules ------------------------
+
+    def test_output_keeps_frame_rate_sample_width_channels(self):
+        out = self.seg.convolve(self.identity_ir, dry=0, wet=1)
+        self.assertEqual(out.frame_rate, self.seg.frame_rate)
+        self.assertEqual(out.sample_width, self.seg.sample_width)
+        self.assertEqual(out.channels, self.seg.channels)
+
+    def test_impulse_response_frame_rate_is_matched(self):
+        ir = self._mono([32767, 0, 0], frame_rate=4000)
+        out = self.seg.convolve(ir, dry=0, wet=1)
+        self.assertEqual(out.frame_rate, self.frame_rate)
+        self.assertEqual(out.sample_width, self.sample_width)
+
+    def test_8bit_and_32bit_outputs_keep_sample_width(self):
+        for sample_width, typecode, full_scale in ((1, 'b', 127),
+                                                   (4, 'i', 2147483647)):
+            seg = self.seg.set_sample_width(sample_width)
+            ir = AudioSegment(
+                array.array(typecode, [full_scale, 0, 0]),
+                sample_width=sample_width,
+                frame_rate=self.frame_rate, channels=1)
+            out = seg.convolve(ir, dry=0, wet=1)
+            self.assertEqual(out.sample_width, sample_width)
+            # a full-scale unit impulse reproduces the input exactly
+            self.assertEqual(out.get_array_of_samples().tolist(),
+                             seg.get_array_of_samples().tolist())
+
+    def test_result_survives_wav_export_round_trip(self):
+        out = self.seg.convolve(
+            self.two_tap_ir, dry=0.3, wet=0.7, include_tail=True)
+        with NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+            path = tmp.name
+        try:
+            out.export(path, format='wav')
+            reloaded = AudioSegment.from_wav(path)
+            self.assertEqual(reloaded.frame_rate, out.frame_rate)
+            self.assertEqual(reloaded.channels, out.channels)
+            self.assertEqual(reloaded.sample_width, out.sample_width)
+            self.assertEqual(int(reloaded.frame_count()),
+                             int(out.frame_count()))
+            self.assertEqual(reloaded.get_array_of_samples().tolist(),
+                             out.get_array_of_samples().tolist())
+        finally:
+            os.unlink(path)
+
+    def test_stereo_result_survives_wav_export_round_trip(self):
+        stereo = AudioSegment.from_mono_audiosegments(
+            self.seg, self.seg)
+        out = stereo.convolve(
+            self.two_tap_ir, dry=0.5, wet=0.5, include_tail=True)
+        with NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+            path = tmp.name
+        try:
+            out.export(path, format='wav')
+            reloaded = AudioSegment.from_wav(path)
+            self.assertEqual(reloaded.channels, 2)
+            self.assertEqual(reloaded.get_array_of_samples().tolist(),
+                             out.get_array_of_samples().tolist())
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,10 @@ setup(
     url='http://pydub.com',
     packages=['pydub'],
     long_description=__doc__,
+    extras_require={
+        # numpy is required by pydub.effects.convolve (convolution reverb)
+        'convolve': ['numpy'],
+    },
     classifiers=[
         'Development Status :: 5 - Production/Stable',
         'License :: OSI Approved :: MIT License',

@@ -16,6 +16,65 @@ if sys.version_info >= (3, 0):
     xrange = range
 
 
+def _require_numpy():
+    try:
+        import numpy
+    except ImportError:
+        raise ImportError(
+            "pydub.effects.convolve requires numpy. "
+            "Install it with: pip install numpy"
+        )
+    return numpy
+
+
+def _float_to_samples(np, data, array_type, sample_width):
+    """
+    Convert float values expressed in integer PCM units back to packed
+    integer PCM. Values outside the representable range are saturated
+    (clipped). pydub stores PCM little-endian, as used by the WAV container.
+    """
+    max_amplitude = (1 << (sample_width * 8 - 1)) - 1
+    min_amplitude = -(max_amplitude + 1)
+    rounded = np.rint(data)
+    clipped = np.clip(rounded, min_amplitude, max_amplitude)
+    int_dtype = '<i%d' % sample_width
+    return array.array(array_type, clipped.astype(int_dtype).tobytes())
+
+
+def _fft_convolve(np, signal, impulse):
+    """
+    Full linear convolution of two 1-D arrays, computed with a single FFT of
+    size n + m - 1. Both the one-shot and the block-based code paths call
+    this exact function, which guarantees the two paths agree sample for
+    sample (before integer quantization).
+    """
+    n = signal.shape[0] + impulse.shape[0] - 1
+    if n <= 0:
+        return np.zeros(0, dtype=np.float64)
+    spectrum = np.fft.rfft(signal, n) * np.fft.rfft(impulse, n)
+    return np.fft.irfft(spectrum, n)
+
+
+def _block_fft_convolve(np, signal, impulse, block_frames):
+    """
+    Linear convolution of two 1-D arrays processed in fixed-size blocks,
+    using overlap-add. Each block is convolved with the full impulse via
+    `_fft_convolve`, so the assembled output is identical to the one-shot
+    convolution apart from floating point round-off.
+    """
+    m = impulse.shape[0]
+    if m == 0:
+        return np.zeros(signal.shape[0], dtype=np.float64)
+
+    block_frames = max(1, int(block_frames))
+    output = np.zeros(signal.shape[0] + m - 1, dtype=np.float64)
+    for start in xrange(0, signal.shape[0], block_frames):
+        block = signal[start:start + block_frames]
+        conv = _fft_convolve(np, block, impulse)
+        output[start:start + conv.shape[0]] += conv
+    return output
+
+
 @register_pydub_effect
 def apply_mono_filter_to_each_channel(seg, filter_fn):
     n_channels = seg.channels
@@ -335,7 +394,185 @@ def apply_gain_stereo(seg, left_gain=0.0, right_gain=0.0):
     right_data = audioop.tostereo(right_data, right.sample_width, 0, 1)
     
     output = audioop.add(left_data, right_data, seg.sample_width)
-    
+
     return seg._spawn(data=output,
                 overrides={'channels': 2,
                            'frame_width': 2 * seg.sample_width})
+
+
+@register_pydub_effect
+def convolve(seg, impulse_response, dry=1.0, wet=1.0,
+             include_tail=False, chunk_duration=10000):
+    """
+    Convolve the audio segment with an impulse response, e.g. apply the
+    reverb of a room recorded as an impulse response (IR).
+
+    Arguments:
+
+        impulse_response (AudioSegment):
+            The impulse response to convolve with. A mono impulse response is
+            applied to every channel of the segment; otherwise the number of
+            channels must match that of the segment. Its frame rate and
+            sample width are converted to match the segment before
+            processing, so the output keeps the segment's frame rate and
+            sample width. The IR samples are interpreted relative to the
+            full-scale level of the sample width: an IR whose first sample is
+            at full scale and whose other samples are zero is therefore an
+            exact identity, and an IR tap at half full scale applies a 0.5
+            gain (no automatic gain normalization is performed).
+
+        dry (float):
+            Gain of the unprocessed (dry) signal, between 0.0 and 1.0. The
+            default of 1.0 keeps the original signal at full level.
+
+        wet (float):
+            Gain of the convolved (wet) signal, between 0.0 and 1.0. The
+            default of 1.0 mixes the full convolved signal in.
+
+        include_tail (bool):
+            When True (the default is False), the output keeps the reverb
+            tail and is (segment + impulse response - 1 frame) long. When
+            False, the output has exactly the same length as the input
+            segment, i.e. the part of the convolution ringing past the end
+            of the input is discarded.
+
+        chunk_duration (int):
+            Block size in milliseconds used for the block-based (overlap-add)
+            convolution of long signals. Signals that fit in one block are
+            convolved in a single FFT. The block-based result and the
+            one-shot result are computed with the same FFT routine and agree
+            to within integer quantization error.
+
+    Behavior and rules:
+
+        * An empty impulse response (zero frames) raises ValueError.
+        * An impulse response with a channel count that is neither 1 nor the
+          segment's channel count raises ValueError.
+        * dry and wet must be finite numbers in the range 0.0 - 1.0; anything
+          else (including NaN and infinity) raises ValueError. Negative gains
+          or gains above 1.0 are rejected rather than silently clipping.
+        * The output keeps the segment's frame rate, sample width and channel
+          count. Internally the math is done in 64-bit float; the convolution
+          is quantized to integer PCM units before the dry/wet mix, so the
+          one-shot and block-based paths produce identical samples and a
+          full-scale unit impulse is an exact identity. On return the mixed
+          samples are rounded and saturated to the segment's integer format,
+          so an overloaded mix clips instead of wrapping.
+        * Convolving an all-silent segment yields an all-silent result.
+        * An empty (zero-length) segment is returned unchanged.
+
+    Requires numpy.
+    """
+    np = _require_numpy()
+
+    if not isinstance(impulse_response, seg.__class__):
+        raise TypeError(
+            "impulse_response must be an AudioSegment instance, got {0}".format(
+                type(impulse_response).__name__))
+
+    for name, value in (("dry", dry), ("wet", wet)):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "{0} must be a number between 0.0 and 1.0".format(name))
+        if math.isnan(value) or math.isinf(value) \
+                or not 0.0 <= value <= 1.0:
+            raise ValueError(
+                "{0} must be a finite number between 0.0 and 1.0, got {1}".format(
+                    name, value))
+
+    if int(impulse_response.frame_count()) == 0:
+        raise ValueError(
+            "impulse_response must contain at least one frame")
+
+    if impulse_response.channels not in (1, seg.channels):
+        raise ValueError(
+            "impulse_response has {0} channel(s); it must be mono (1 "
+            "channel, applied to every channel) or match the segment's "
+            "channel count ({1})".format(
+                impulse_response.channels, seg.channels))
+
+    if int(seg.frame_count()) == 0:
+        return seg
+
+    # Match the IR's frame rate and sample width to the segment so that the
+    # convolution indices and the output format are well defined.
+    ir = (impulse_response
+          .set_frame_rate(seg.frame_rate)
+          .set_sample_width(seg.sample_width))
+
+    input_frames = int(seg.frame_count())
+    ir_frames = int(ir.frame_count())
+    output_frames = input_frames + ir_frames - 1 if include_tail \
+        else input_frames
+
+    # deinterleave by hand: split_to_mono()'s spawned segments can keep the
+    # parent's channels/frame_width metadata, but the raw samples are simply
+    # interleaved frame by frame, so derive the real channel count from the
+    # data length and slice directly.
+    # The signal stays in integer PCM units while the impulse response is
+    # normalized to the full-scale level (2 ** (bits - 1)), so an IR whose
+    # peak reaches full scale has unity gain: a full-scale unit impulse
+    # ([full_scale, 0, 0, ...]) is an exact identity, and an IR tap of half
+    # full scale is a 0.5 gain. The convolution is evaluated in float64.
+    full_scale = float(1 << (seg.sample_width * 8 - 1))
+    input_raw = np.asarray(seg.get_array_of_samples(), dtype=np.float64)
+    ir_raw = np.asarray(ir.get_array_of_samples(), dtype=np.float64) / full_scale
+    input_channel_count = input_raw.shape[0] // input_frames
+    ir_channel_count = ir_raw.shape[0] // ir_frames
+    input_channels = [
+        input_raw[channel_i::input_channel_count]
+        for channel_i in xrange(input_channel_count)
+    ]
+    ir_channels = [
+        ir_raw[channel_i::ir_channel_count]
+        for channel_i in xrange(ir_channel_count)
+    ]
+
+    block_frames = max(1, int(seg.frame_count(ms=chunk_duration)))
+
+    output_channels = []
+    for channel_i in xrange(input_channel_count):
+        signal = input_channels[channel_i]
+        # A mono IR is reused for every channel; otherwise channel i of the
+        # segment is convolved with channel i of the IR.
+        impulse = ir_channels[0] if ir_channel_count == 1 \
+            else ir_channels[channel_i]
+
+        if input_frames <= block_frames:
+            convolved = _fft_convolve(np, signal, impulse)
+        else:
+            convolved = _block_fft_convolve(
+                np, signal, impulse, block_frames)
+
+        # Quantize the convolution itself to integer PCM units before the
+        # dry/wet mix: FFT round-off is removed here, a unit impulse becomes
+        # an exact identity, and the one-shot and block paths stay identical.
+        # Clipping is deferred to the final mix so the wet signal alone is
+        # allowed to exceed full scale.
+        convolved = np.rint(convolved)
+
+        # pad the dry signal with silence when the reverb tail is kept
+        dry_signal = signal
+        if output_frames > input_frames:
+            dry_signal = np.concatenate(
+                (signal, np.zeros(output_frames - input_frames)))
+
+        mixed = dry * dry_signal[:output_frames] \
+            + wet * convolved[:output_frames]
+
+        output_channels.append(
+            _float_to_samples(np, mixed, seg.array_type, seg.sample_width))
+
+    if input_channel_count == 1:
+        out_data = output_channels[0]
+    else:
+        interleaved = array.array(
+            seg.array_type,
+            b'\0' * (output_frames * input_channel_count * seg.sample_width))
+        for channel_i, channel_data in enumerate(output_channels):
+            interleaved[channel_i::input_channel_count] = channel_data
+        out_data = interleaved
+
+    return seg._spawn(data=out_data)

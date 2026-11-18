@@ -612,6 +612,40 @@ Collection of DSP effects that are implemented by `AudioSegment` objects.
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
 
+### AudioSegment(…).convolve()
+
+Convolve the audio with an impulse response (IR), for example to give a recording the reverb of a room whose impulse response was measured. Requires [numpy](https://numpy.org/).
+
+```python
+from pydub import AudioSegment
+
+voice = AudioSegment.from_file("dialogue.wav")
+room_ir = AudioSegment.from_file("stone_room_ir.wav")
+
+reverbed = voice.convolve(room_ir, dry=0.8, wet=0.4, include_tail=True)
+```
+
+A mono impulse response is applied to every channel; otherwise the impulse response must have the same number of channels as the segment. Its frame rate and sample width are converted to match the segment, and the output keeps the segment's frame rate, sample width and channel count. IR samples are interpreted relative to full scale, so an IR of `[full_scale, 0, 0, ...]` is an exact identity.
+
+**Supported keyword arguments**:
+
+- `impulse_response` | required
+  An `AudioSegment` containing the impulse response. An empty segment raises `ValueError`; a channel count that is neither 1 nor the segment's raises `ValueError`.
+
+- `dry` | example: `0.8` | default: `1.0`
+  Gain of the unprocessed signal, a finite number from `0.0` to `1.0`.
+
+- `wet` | example: `0.4` | default: `1.0`
+  Gain of the convolved signal, a finite number from `0.0` to `1.0`. Values outside the range (including `NaN` and infinity) raise `ValueError`.
+
+- `include_tail` | example: `True` | default: `False`
+  When `True`, the output is `segment + impulse_response - 1 frame` long so the reverb tail is kept. When `False`, the output has exactly the input's length and the tail is discarded.
+
+- `chunk_duration` | example: `5000` | default: `10000`
+  Block size in milliseconds for the overlap-add convolution used on long signals. The block-based output matches the one-shot FFT convolution to within one quantized sample. Values below one frame are clamped to a single frame.
+
+The internal math runs in 64-bit float; the convolution is quantized to the integer PCM format before the dry/wet mix, and the final result is saturated (clipped) rather than wrapped when it overloads. An all-silent input produces an all-silent output, and an empty segment is returned unchanged.
+
 ## Silence
 
 Various functions for finding/manipulating silence in AudioSegments. For creating silent AudioSegments, see AudioSegment.silent().
